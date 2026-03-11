@@ -1,0 +1,11 @@
+.gradle/
+local.properties
+build/
+app/build/
+.android-sdk/
+.cxx/
+.idea/
+*.iml
+*.apk
+*.aab
+.conda/

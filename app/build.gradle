@@ -1,0 +1,64 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.example.metareader'
+    compileSdk 34
+    ndkVersion providers.gradleProperty('androidNdkVersion').get()
+
+    defaultConfig {
+        applicationId 'com.example.metareader'
+        minSdk 29
+        targetSdk 34
+        versionCode 1
+        versionName '0.1.0'
+
+        externalNativeBuild {
+            cmake {
+                arguments '-DANDROID_STL=c++_shared'
+            }
+        }
+
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+    }
+
+    buildTypes {
+        debug {
+            debuggable true
+            jniDebuggable true
+        }
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    buildFeatures {
+        prefab true
+    }
+
+    externalNativeBuild {
+        cmake {
+            path file('src/main/cpp/CMakeLists.txt')
+            version '3.22.1'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging true
+        }
+    }
+}
+
+dependencies {
+    implementation "org.khronos.openxr:openxr_loader_for_android:${providers.gradleProperty('openxrLoaderVersion').get()}"
+}
