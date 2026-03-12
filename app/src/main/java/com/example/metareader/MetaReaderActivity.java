@@ -5,7 +5,6 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
-import android.hardware.usb.UsbManager;
 import android.app.NativeActivity;
 import android.os.Bundle;
 import android.util.Log;
@@ -36,8 +35,6 @@ public final class MetaReaderActivity extends NativeActivity {
 
     private QuestTeleopDiscoveryManager discoveryManager;
     private boolean usbReceiverRegistered;
-    private boolean resumed;
-    private Boolean wiredModeEnabled;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -49,7 +46,6 @@ public final class MetaReaderActivity extends NativeActivity {
     @Override
     protected void onResume() {
         super.onResume();
-        resumed = true;
         ensureHandTrackingPermission();
         registerUsbStateReceiver();
         refreshTransportMode();
@@ -68,8 +64,9 @@ public final class MetaReaderActivity extends NativeActivity {
 
     @Override
     protected void onPause() {
-        resumed = false;
-        stopWirelessDiscovery();
+        if (discoveryManager != null) {
+            discoveryManager.stop();
+        }
         unregisterUsbStateReceiver();
         super.onPause();
     }
@@ -103,36 +100,19 @@ public final class MetaReaderActivity extends NativeActivity {
     }
 
     private void refreshTransportMode() {
-        Intent usbState = registerReceiver(null, new IntentFilter(ACTION_USB_STATE));
-        applyTransportMode(usbState);
+        applyTransportMode(registerReceiver(null, new IntentFilter(ACTION_USB_STATE)));
     }
 
     private void applyTransportMode(Intent usbState) {
         boolean wiredMode = isAdbUsbConnected(usbState);
-        String detail = describeUsbState(usbState);
-        if (wiredModeEnabled != null && wiredModeEnabled == wiredMode) {
-            nativeOnTransportModeChanged(wiredMode ? "WIRED" : "WIRELESS", detail, WIRED_TCP_PORT);
-            return;
-        }
-
-        wiredModeEnabled = wiredMode;
-        nativeOnTransportModeChanged(wiredMode ? "WIRED" : "WIRELESS", detail, WIRED_TCP_PORT);
+        nativeOnTransportModeChanged(wiredMode ? "WIRED" : "WIRELESS", WIRED_TCP_PORT);
 
         if (wiredMode) {
-            stopWirelessDiscovery();
-            Log.i(LOG_TAG, "Transport mode selected: wired ADB reverse TCP via 127.0.0.1:" + WIRED_TCP_PORT + " (" + detail + ")");
-            return;
-        }
-
-        if (resumed && discoveryManager != null) {
+            if (discoveryManager != null) {
+                discoveryManager.stop();
+            }
+        } else if (discoveryManager != null) {
             discoveryManager.start();
-        }
-        Log.i(LOG_TAG, "Transport mode selected: wireless Avahi DNS-SD discovery (" + detail + ")");
-    }
-
-    private void stopWirelessDiscovery() {
-        if (discoveryManager != null) {
-            discoveryManager.stop();
         }
     }
 
@@ -142,7 +122,7 @@ public final class MetaReaderActivity extends NativeActivity {
         }
 
         Log.i(LOG_TAG, "Requesting hand tracking permission.");
-        requestPermissions(new String[] {HAND_TRACKING_PERMISSION}, HAND_TRACKING_PERMISSION_REQUEST_CODE);
+        requestPermissions(new String[]{HAND_TRACKING_PERMISSION}, HAND_TRACKING_PERMISSION_REQUEST_CODE);
     }
 
     private static boolean isAdbUsbConnected(Intent usbState) {
@@ -161,17 +141,6 @@ public final class MetaReaderActivity extends NativeActivity {
         return connected && configured && usbFunctions.contains("adb");
     }
 
-    private static String describeUsbState(Intent usbState) {
-        if (usbState == null) {
-            return "usb_state=unavailable";
-        }
-
-        return "connected=" + usbState.getBooleanExtra("connected", false)
-            + ", configured=" + usbState.getBooleanExtra("configured", false)
-            + ", adb=" + usbState.getBooleanExtra("adb", false)
-            + ", sys.usb.state=" + getSystemUsbState();
-    }
-
     private static String getSystemUsbState() {
         try {
             Class<?> systemProperties = Class.forName("android.os.SystemProperties");
@@ -183,8 +152,7 @@ public final class MetaReaderActivity extends NativeActivity {
         }
     }
 
-    static native void nativeOnTransportModeChanged(String mode, String detail, int wiredPort);
-    static native void nativeOnDiscoveryState(String state, String detail);
-    static native void nativeOnServiceResolved(String serviceName, String host, int port, String txtSummary);
-    static native void nativeOnServiceLost(String serviceName);
+    static native void nativeOnTransportModeChanged(String mode, int wiredPort);
+    static native void nativeOnServiceResolved(String host, int port);
+    static native void nativeOnServiceLost();
 }

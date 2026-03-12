@@ -1,24 +1,12 @@
 #include "quest_passthrough_app.hpp"
+#include "hud_renderer.hpp"
 
 #include <jni.h>
 #include <android/log.h>
-#include <arpa/inet.h>
-#include <dlfcn.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <ifaddrs.h>
-#include <net/if.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
-#include <cmath>
-#include <cstring>
-#include <iomanip>
-#include <mutex>
 #include <sstream>
 #include <thread>
 #include <vector>
@@ -26,130 +14,26 @@
 namespace {
 
 constexpr const char* kLogTag = "MetaReaderXR";
-constexpr const char* kWiredLoopbackHost = "127.0.0.1";
-constexpr uint16_t kDefaultWiredLoopbackPort = 5005;
-constexpr auto kReconnectDelay = std::chrono::milliseconds(1000);
-constexpr int kConnectTimeoutMs = 150;
-constexpr uint64_t kHandDiagnosticsLogEveryFrames = 180;
 
 #ifndef EGL_OPENGL_ES3_BIT_KHR
 #define EGL_OPENGL_ES3_BIT_KHR 0x00000040
 #endif
 
-void LogInfo(const std::string& message) {
-    __android_log_write(ANDROID_LOG_INFO, kLogTag, message.c_str());
-}
-
 void LogError(const std::string& message) {
     __android_log_write(ANDROID_LOG_ERROR, kLogTag, message.c_str());
 }
-
-void LogHandJointDiagnostics(
-    const char* handLabel,
-    uint64_t frameSequence,
-    const XrHandJointLocationEXT& wrist,
-    const XrHandJointLocationEXT& palm,
-    size_t trackedJointCount,
-    size_t trackedFingertipCount) {
-    std::ostringstream stream;
-    stream << "Hand diagnostics [" << handLabel << "] seq=" << frameSequence
-           << " tracked_joints=" << trackedJointCount
-           << " tracked_fingertips=" << trackedFingertipCount
-           << " wrist_flags=0x" << std::hex << static_cast<uint64_t>(wrist.locationFlags)
-           << " palm_flags=0x" << static_cast<uint64_t>(palm.locationFlags)
-           << std::dec
-           << " wrist_radius=" << wrist.radius
-           << " palm_radius=" << palm.radius;
-    LogInfo(stream.str());
-}
-
-struct TransportSelectionState {
-    bool wiredMode{false};
-    uint16_t wiredPort{kDefaultWiredLoopbackPort};
-    bool wirelessEndpointAvailable{false};
-    std::string wirelessHost;
-    uint16_t wirelessPort{0};
-    std::string serviceName;
-    std::string detail;
-};
-
-std::mutex gTransportSelectionMutex;
-TransportSelectionState gTransportSelectionState;
 
 std::string JStringToUtf8(JNIEnv* env, jstring value) {
     if (value == nullptr) {
         return {};
     }
-
     const char* utfChars = env->GetStringUTFChars(value, nullptr);
     if (utfChars == nullptr) {
         return {};
     }
-
     std::string text(utfChars);
     env->ReleaseStringUTFChars(value, utfChars);
     return text;
-}
-
-std::string EndpointToString(const std::string& host, uint16_t port) {
-    if (host.empty()) {
-        return "SEARCHING";
-    }
-
-    std::ostringstream stream;
-    stream << host;
-    if (port > 0) {
-        stream << ':' << port;
-    }
-    return stream.str();
-}
-
-void SetTransportModeSelection(bool wiredMode, uint16_t wiredPort, const std::string& detail) {
-    std::scoped_lock lock(gTransportSelectionMutex);
-    gTransportSelectionState.wiredMode = wiredMode;
-    gTransportSelectionState.wiredPort = wiredPort > 0 ? wiredPort : kDefaultWiredLoopbackPort;
-    gTransportSelectionState.detail = detail;
-    if (wiredMode) {
-        gTransportSelectionState.wirelessEndpointAvailable = false;
-        gTransportSelectionState.wirelessHost.clear();
-        gTransportSelectionState.wirelessPort = 0;
-        gTransportSelectionState.serviceName.clear();
-    }
-}
-
-void SetWirelessEndpointSelection(
-    const std::string& host,
-    uint16_t port,
-    const std::string& serviceName) {
-    std::scoped_lock lock(gTransportSelectionMutex);
-    gTransportSelectionState.wirelessEndpointAvailable = !host.empty() && port > 0;
-    gTransportSelectionState.wirelessHost = host;
-    gTransportSelectionState.wirelessPort = port;
-    gTransportSelectionState.serviceName = serviceName;
-}
-
-void ClearWirelessEndpointSelection(const std::string& serviceName) {
-    std::scoped_lock lock(gTransportSelectionMutex);
-    gTransportSelectionState.wirelessEndpointAvailable = false;
-    gTransportSelectionState.wirelessHost.clear();
-    gTransportSelectionState.wirelessPort = 0;
-    gTransportSelectionState.serviceName = serviceName;
-}
-
-bool WriteAllToSocket(int socketFd, const std::vector<uint8_t>& packet) {
-    size_t offset = 0;
-    while (offset < packet.size()) {
-        const ssize_t bytesSent = send(
-            socketFd,
-            packet.data() + offset,
-            packet.size() - offset,
-            MSG_NOSIGNAL);
-        if (bytesSent <= 0) {
-            return false;
-        }
-        offset += static_cast<size_t>(bytesSent);
-    }
-    return true;
 }
 
 void LogXrResult(XrInstance instance, const char* context, XrResult result) {
@@ -174,247 +58,112 @@ XrPosef IdentityPose() {
     return pose;
 }
 
-XrQuaternionf NormalizeQuaternion(XrQuaternionf quaternion) {
-    const float length = std::sqrt(
-        quaternion.x * quaternion.x +
-        quaternion.y * quaternion.y +
-        quaternion.z * quaternion.z +
-        quaternion.w * quaternion.w);
-    if (length <= 0.0f) {
-        return XrQuaternionf{0.0f, 0.0f, 0.0f, 1.0f};
+constexpr std::array<XrHandJointEXT, 7> kHandOverlayJoints{
+    XR_HAND_JOINT_WRIST_EXT,
+    XR_HAND_JOINT_PALM_EXT,
+    XR_HAND_JOINT_THUMB_TIP_EXT,
+    XR_HAND_JOINT_INDEX_TIP_EXT,
+    XR_HAND_JOINT_MIDDLE_TIP_EXT,
+    XR_HAND_JOINT_RING_TIP_EXT,
+    XR_HAND_JOINT_LITTLE_TIP_EXT,
+};
+
+constexpr std::array<std::pair<XrHandJointEXT, const char*>, 5> kFingertipJoints{{
+    {XR_HAND_JOINT_THUMB_TIP_EXT, "thumb_tip"},
+    {XR_HAND_JOINT_INDEX_TIP_EXT, "index_tip"},
+    {XR_HAND_JOINT_MIDDLE_TIP_EXT, "middle_tip"},
+    {XR_HAND_JOINT_RING_TIP_EXT, "ring_tip"},
+    {XR_HAND_JOINT_LITTLE_TIP_EXT, "little_tip"},
+}};
+
+bool CreateColorSwapchain(
+    XrSession session,
+    XrInstance instance,
+    uint32_t width,
+    uint32_t height,
+    const char* label,
+    XrSwapchain* swapchain,
+    std::vector<XrSwapchainImageOpenGLESKHR>* images) {
+    uint32_t formatCount = 0;
+    XrResult xrResult = xrEnumerateSwapchainFormats(session, 0, &formatCount, nullptr);
+    if (XR_FAILED(xrResult)) {
+        LogXrResult(instance, (std::string("xrEnumerateSwapchainFormats(") + label + " count)").c_str(), xrResult);
+        return false;
     }
 
-    const float inverseLength = 1.0f / length;
-    quaternion.x *= inverseLength;
-    quaternion.y *= inverseLength;
-    quaternion.z *= inverseLength;
-    quaternion.w *= inverseLength;
-    return quaternion;
-}
-
-XrQuaternionf MultiplyQuaternion(const XrQuaternionf& left, const XrQuaternionf& right) {
-    return NormalizeQuaternion(XrQuaternionf{
-        left.w * right.x + left.x * right.w + left.y * right.z - left.z * right.y,
-        left.w * right.y - left.x * right.z + left.y * right.w + left.z * right.x,
-        left.w * right.z + left.x * right.y - left.y * right.x + left.z * right.w,
-        left.w * right.w - left.x * right.x - left.y * right.y - left.z * right.z,
-    });
-}
-
-const std::array<XrHandJointEXT, 7>& HandOverlayJointSet() {
-    static const std::array<XrHandJointEXT, 7> joints{
-        XR_HAND_JOINT_WRIST_EXT,
-        XR_HAND_JOINT_PALM_EXT,
-        XR_HAND_JOINT_THUMB_TIP_EXT,
-        XR_HAND_JOINT_INDEX_TIP_EXT,
-        XR_HAND_JOINT_MIDDLE_TIP_EXT,
-        XR_HAND_JOINT_RING_TIP_EXT,
-        XR_HAND_JOINT_LITTLE_TIP_EXT,
-    };
-    return joints;
-}
-
-const std::array<std::pair<XrHandJointEXT, const char*>, 5>& FingertipJointSet() {
-    static const std::array<std::pair<XrHandJointEXT, const char*>, 5> joints{{
-        {XR_HAND_JOINT_THUMB_TIP_EXT, "thumb_tip"},
-        {XR_HAND_JOINT_INDEX_TIP_EXT, "index_tip"},
-        {XR_HAND_JOINT_MIDDLE_TIP_EXT, "middle_tip"},
-        {XR_HAND_JOINT_RING_TIP_EXT, "ring_tip"},
-        {XR_HAND_JOINT_LITTLE_TIP_EXT, "little_tip"},
-    }};
-    return joints;
-}
-
-std::string JsonEscape(const std::string& value) {
-    std::string escaped;
-    escaped.reserve(value.size());
-    for (const char character : value) {
-        switch (character) {
-            case '\\':
-                escaped += "\\\\";
-                break;
-            case '"':
-                escaped += "\\\"";
-                break;
-            default:
-                escaped += character;
-                break;
-        }
-    }
-    return escaped;
-}
-
-void AppendVector3Json(std::ostringstream& stream, const XrVector3f& value) {
-    stream << '[' << value.x << ',' << value.y << ',' << value.z << ']';
-}
-
-void AppendQuaternionJson(std::ostringstream& stream, const XrQuaternionf& value) {
-    stream << '[' << value.x << ',' << value.y << ',' << value.z << ',' << value.w << ']';
-}
-
-void AppendPoseJson(std::ostringstream& stream, const XrPosef& pose) {
-    stream << '{' << "\"position\":";
-    AppendVector3Json(stream, pose.position);
-    stream << ",\"orientation\":";
-    AppendQuaternionJson(stream, pose.orientation);
-    stream << '}';
-}
-
-const std::array<uint8_t, 7>& GlyphFor(char character) {
-    static const std::array<uint8_t, 7> blank{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-    static const std::array<uint8_t, 7> dash{0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00};
-    static const std::array<uint8_t, 7> dot{0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x0c};
-    static const std::array<uint8_t, 7> colon{0x00, 0x0c, 0x0c, 0x00, 0x0c, 0x0c, 0x00};
-
-    static const std::array<uint8_t, 7> zero{0x0e, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0e};
-    static const std::array<uint8_t, 7> one{0x04, 0x0c, 0x14, 0x04, 0x04, 0x04, 0x1f};
-    static const std::array<uint8_t, 7> two{0x0e, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1f};
-    static const std::array<uint8_t, 7> three{0x1e, 0x01, 0x01, 0x0e, 0x01, 0x01, 0x1e};
-    static const std::array<uint8_t, 7> four{0x02, 0x06, 0x0a, 0x12, 0x1f, 0x02, 0x02};
-    static const std::array<uint8_t, 7> five{0x1f, 0x10, 0x10, 0x1e, 0x01, 0x01, 0x1e};
-    static const std::array<uint8_t, 7> six{0x0e, 0x10, 0x10, 0x1e, 0x11, 0x11, 0x0e};
-    static const std::array<uint8_t, 7> seven{0x1f, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08};
-    static const std::array<uint8_t, 7> eight{0x0e, 0x11, 0x11, 0x0e, 0x11, 0x11, 0x0e};
-    static const std::array<uint8_t, 7> nine{0x0e, 0x11, 0x11, 0x0f, 0x01, 0x01, 0x0e};
-
-    static const std::array<uint8_t, 7> a{0x0e, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11};
-    static const std::array<uint8_t, 7> b{0x1e, 0x11, 0x11, 0x1e, 0x11, 0x11, 0x1e};
-    static const std::array<uint8_t, 7> c{0x0e, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0e};
-    static const std::array<uint8_t, 7> d{0x1c, 0x12, 0x11, 0x11, 0x11, 0x12, 0x1c};
-    static const std::array<uint8_t, 7> e{0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x1f};
-    static const std::array<uint8_t, 7> f{0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x10};
-    static const std::array<uint8_t, 7> g{0x0f, 0x10, 0x10, 0x17, 0x11, 0x11, 0x0f};
-    static const std::array<uint8_t, 7> h{0x11, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11};
-    static const std::array<uint8_t, 7> i{0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x1f};
-    static const std::array<uint8_t, 7> j{0x1f, 0x02, 0x02, 0x02, 0x12, 0x12, 0x0c};
-    static const std::array<uint8_t, 7> k{0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11};
-    static const std::array<uint8_t, 7> l{0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1f};
-    static const std::array<uint8_t, 7> m{0x11, 0x1b, 0x15, 0x15, 0x11, 0x11, 0x11};
-    static const std::array<uint8_t, 7> n{0x11, 0x11, 0x19, 0x15, 0x13, 0x11, 0x11};
-    static const std::array<uint8_t, 7> o{0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e};
-    static const std::array<uint8_t, 7> p{0x1e, 0x11, 0x11, 0x1e, 0x10, 0x10, 0x10};
-    static const std::array<uint8_t, 7> q{0x0e, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0d};
-    static const std::array<uint8_t, 7> r{0x1e, 0x11, 0x11, 0x1e, 0x14, 0x12, 0x11};
-    static const std::array<uint8_t, 7> s{0x0f, 0x10, 0x10, 0x0e, 0x01, 0x01, 0x1e};
-    static const std::array<uint8_t, 7> t{0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04};
-    static const std::array<uint8_t, 7> u{0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e};
-    static const std::array<uint8_t, 7> v{0x11, 0x11, 0x11, 0x11, 0x11, 0x0a, 0x04};
-    static const std::array<uint8_t, 7> w{0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0a};
-    static const std::array<uint8_t, 7> x{0x11, 0x11, 0x0a, 0x04, 0x0a, 0x11, 0x11};
-    static const std::array<uint8_t, 7> y{0x11, 0x11, 0x0a, 0x04, 0x04, 0x04, 0x04};
-    static const std::array<uint8_t, 7> z{0x1f, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1f};
-
-    switch (character) {
-        case '0': return zero;
-        case '1': return one;
-        case '2': return two;
-        case '3': return three;
-        case '4': return four;
-        case '5': return five;
-        case '6': return six;
-        case '7': return seven;
-        case '8': return eight;
-        case '9': return nine;
-        case 'A': return a;
-        case 'B': return b;
-        case 'C': return c;
-        case 'D': return d;
-        case 'E': return e;
-        case 'F': return f;
-        case 'G': return g;
-        case 'H': return h;
-        case 'I': return i;
-        case 'J': return j;
-        case 'K': return k;
-        case 'L': return l;
-        case 'M': return m;
-        case 'N': return n;
-        case 'O': return o;
-        case 'P': return p;
-        case 'Q': return q;
-        case 'R': return r;
-        case 'S': return s;
-        case 'T': return t;
-        case 'U': return u;
-        case 'V': return v;
-        case 'W': return w;
-        case 'X': return x;
-        case 'Y': return y;
-        case 'Z': return z;
-        case '-': return dash;
-        case '.': return dot;
-        case ':': return colon;
-        case ' ': return blank;
-        default: return blank;
-    }
-}
-
-void BlendPixel(std::vector<uint8_t>& pixels, uint32_t width, uint32_t height, int x, int y,
-                uint8_t red, uint8_t green, uint8_t blue, uint8_t alpha) {
-    if (x < 0 || y < 0 || x >= static_cast<int>(width) || y >= static_cast<int>(height)) {
-        return;
+    std::vector<int64_t> formats(formatCount);
+    xrResult = xrEnumerateSwapchainFormats(session, formatCount, &formatCount, formats.data());
+    if (XR_FAILED(xrResult)) {
+        LogXrResult(instance, (std::string("xrEnumerateSwapchainFormats(") + label + " list)").c_str(), xrResult);
+        return false;
     }
 
-    const size_t index = (static_cast<size_t>(y) * width + static_cast<size_t>(x)) * 4;
-    const float srcAlpha = static_cast<float>(alpha) / 255.0f;
-    const float dstAlpha = static_cast<float>(pixels[index + 3]) / 255.0f;
-    const float outAlpha = srcAlpha + dstAlpha * (1.0f - srcAlpha);
-    if (outAlpha <= 0.0f) {
-        return;
+    const std::array<int64_t, 2> preferredFormats{GL_SRGB8_ALPHA8, GL_RGBA8};
+    const auto formatIt = std::find_first_of(formats.begin(), formats.end(), preferredFormats.begin(), preferredFormats.end());
+    const int64_t format = formatIt != formats.end() ? *formatIt : formats.front();
+
+    XrSwapchainCreateInfo createInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    createInfo.format = format;
+    createInfo.sampleCount = 1;
+    createInfo.width = width;
+    createInfo.height = height;
+    createInfo.faceCount = 1;
+    createInfo.arraySize = 1;
+    createInfo.mipCount = 1;
+    createInfo.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+
+    xrResult = xrCreateSwapchain(session, &createInfo, swapchain);
+    if (XR_FAILED(xrResult)) {
+        LogXrResult(instance, (std::string("xrCreateSwapchain(") + label + ")").c_str(), xrResult);
+        return false;
     }
 
-    auto blendChannel = [&](uint8_t src, size_t offset) {
-        const float dst = static_cast<float>(pixels[index + offset]);
-        const float out = (static_cast<float>(src) * srcAlpha + dst * dstAlpha * (1.0f - srcAlpha)) / outAlpha;
-        pixels[index + offset] = static_cast<uint8_t>(std::clamp(out, 0.0f, 255.0f));
-    };
+    uint32_t imageCount = 0;
+    xrResult = xrEnumerateSwapchainImages(*swapchain, 0, &imageCount, nullptr);
+    if (XR_FAILED(xrResult)) {
+        LogXrResult(instance, (std::string("xrEnumerateSwapchainImages(") + label + " count)").c_str(), xrResult);
+        return false;
+    }
 
-    blendChannel(red, 0);
-    blendChannel(green, 1);
-    blendChannel(blue, 2);
-    pixels[index + 3] = static_cast<uint8_t>(std::clamp(outAlpha * 255.0f, 0.0f, 255.0f));
+    images->assign(imageCount, XrSwapchainImageOpenGLESKHR{XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR});
+    xrResult = xrEnumerateSwapchainImages(
+        *swapchain,
+        imageCount,
+        &imageCount,
+        reinterpret_cast<XrSwapchainImageBaseHeader*>(images->data()));
+    if (XR_FAILED(xrResult)) {
+        LogXrResult(instance, (std::string("xrEnumerateSwapchainImages(") + label + " list)").c_str(), xrResult);
+        return false;
+    }
+    return true;
 }
 
-void DrawFilledRect(std::vector<uint8_t>& pixels, uint32_t width, uint32_t height,
-                    int x, int y, int rectWidth, int rectHeight,
-                    uint8_t red, uint8_t green, uint8_t blue, uint8_t alpha) {
-    for (int row = 0; row < rectHeight; ++row) {
-        for (int column = 0; column < rectWidth; ++column) {
-            BlendPixel(pixels, width, height, x + column, y + row, red, green, blue, alpha);
-        }
+bool AcquireSwapchainImageBlocking(XrInstance instance, XrSwapchain swapchain, const char* label, uint32_t* imageIndex) {
+    XrSwapchainImageAcquireInfo acquireInfo{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    XrResult xrResult = xrAcquireSwapchainImage(swapchain, &acquireInfo, imageIndex);
+    if (XR_FAILED(xrResult)) {
+        LogXrResult(instance, (std::string("xrAcquireSwapchainImage(") + label + ")").c_str(), xrResult);
+        return false;
     }
+
+    XrSwapchainImageWaitInfo waitInfo{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    waitInfo.timeout = XR_INFINITE_DURATION;
+    xrResult = xrWaitSwapchainImage(swapchain, &waitInfo);
+    if (XR_FAILED(xrResult)) {
+        LogXrResult(instance, (std::string("xrWaitSwapchainImage(") + label + ")").c_str(), xrResult);
+        return false;
+    }
+    return true;
 }
 
-void DrawChar(std::vector<uint8_t>& pixels, uint32_t width, uint32_t height,
-              int x, int y, int scale, char character,
-              uint8_t red, uint8_t green, uint8_t blue, uint8_t alpha) {
-    const auto& glyph = GlyphFor(character);
-    for (int row = 0; row < 7; ++row) {
-        for (int column = 0; column < 5; ++column) {
-            if ((glyph[row] & (1 << (4 - column))) == 0) {
-                continue;
-            }
-            for (int scaleY = 0; scaleY < scale; ++scaleY) {
-                for (int scaleX = 0; scaleX < scale; ++scaleX) {
-                    BlendPixel(
-                        pixels, width, height,
-                        x + column * scale + scaleX,
-                        y + row * scale + scaleY,
-                        red, green, blue, alpha);
-                }
-            }
-        }
+bool ReleaseSwapchainImageChecked(XrInstance instance, XrSwapchain swapchain, const char* label) {
+    XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    const XrResult xrResult = xrReleaseSwapchainImage(swapchain, &releaseInfo);
+    if (XR_FAILED(xrResult)) {
+        LogXrResult(instance, (std::string("xrReleaseSwapchainImage(") + label + ")").c_str(), xrResult);
+        return false;
     }
-}
-
-void DrawText(std::vector<uint8_t>& pixels, uint32_t width, uint32_t height,
-              int x, int y, int scale, const std::string& text,
-              uint8_t red, uint8_t green, uint8_t blue, uint8_t alpha) {
-    int cursorX = x;
-    for (char character : text) {
-        DrawChar(pixels, width, height, cursorX, y, scale, character, red, green, blue, alpha);
-        cursorX += 6 * scale;
-    }
+    return true;
 }
 
 }  // namespace
@@ -426,19 +175,7 @@ QuestPassthroughApp::~QuestPassthroughApp() {
 }
 
 void QuestPassthroughApp::HandleAppCommand(int32_t cmd) {
-    switch (cmd) {
-        case APP_CMD_RESUME:
-            resumed_ = true;
-            break;
-        case APP_CMD_PAUSE:
-            resumed_ = false;
-            break;
-        case APP_CMD_DESTROY:
-            exitRequested_ = true;
-            break;
-        default:
-            break;
-    }
+    exitRequested_ = exitRequested_ || cmd == APP_CMD_DESTROY;
 }
 
 void QuestPassthroughApp::RunMainLoop() {
@@ -479,9 +216,7 @@ bool QuestPassthroughApp::Initialize() {
         ShutdownEgl();
         return false;
     }
-
     initialized_ = true;
-    LogInfo("Quest passthrough app initialized.");
     return true;
 }
 
@@ -550,33 +285,16 @@ bool QuestPassthroughApp::InitializeEgl() {
 
 bool QuestPassthroughApp::InitializeOpenXr() {
     using PfnInitializeLoader = XrResult(XRAPI_PTR*)(const XrLoaderInitInfoBaseHeaderKHR* loaderInitInfo);
-    PfnInitializeLoader xrInitializeLoaderKHRFn = nullptr;
-
     PFN_xrVoidFunction loaderInitVoidFunction = nullptr;
-    XrResult loaderProcResult = xrGetInstanceProcAddr(
+    const XrResult loaderProcResult = xrGetInstanceProcAddr(
         XR_NULL_HANDLE,
         "xrInitializeLoaderKHR",
         &loaderInitVoidFunction);
-    if (XR_SUCCEEDED(loaderProcResult) && loaderInitVoidFunction != nullptr) {
-        xrInitializeLoaderKHRFn = reinterpret_cast<PfnInitializeLoader>(loaderInitVoidFunction);
-    }
-
-    void* loaderLibrary = nullptr;
-    if (xrInitializeLoaderKHRFn == nullptr) {
-        loaderLibrary = dlopen("libopenxr_loader.so", RTLD_NOW | RTLD_LOCAL);
-        if (loaderLibrary != nullptr) {
-            xrInitializeLoaderKHRFn = reinterpret_cast<PfnInitializeLoader>(
-                dlsym(loaderLibrary, "xrInitializeLoaderKHR"));
-        }
-    }
-
-    if (xrInitializeLoaderKHRFn == nullptr) {
-        LogError("Failed to resolve xrInitializeLoaderKHR via xrGetInstanceProcAddr or libopenxr_loader.so.");
-        if (loaderLibrary != nullptr) {
-            dlclose(loaderLibrary);
-        }
+    if (XR_FAILED(loaderProcResult) || loaderInitVoidFunction == nullptr) {
+        LogError("Failed to resolve xrInitializeLoaderKHR.");
         return false;
     }
+    const auto xrInitializeLoaderKHRFn = reinterpret_cast<PfnInitializeLoader>(loaderInitVoidFunction);
 
     XrLoaderInitInfoAndroidKHR loaderInitInfo{XR_TYPE_LOADER_INIT_INFO_ANDROID_KHR};
     loaderInitInfo.applicationVM = app_->activity->vm;
@@ -584,59 +302,17 @@ bool QuestPassthroughApp::InitializeOpenXr() {
 
     const XrResult loaderResult = xrInitializeLoaderKHRFn(
         reinterpret_cast<const XrLoaderInitInfoBaseHeaderKHR*>(&loaderInitInfo));
-    if (loaderLibrary != nullptr) {
-        dlclose(loaderLibrary);
-    }
     if (XR_FAILED(loaderResult)) {
         LogXrResult(XR_NULL_HANDLE, "xrInitializeLoaderKHR", loaderResult);
         return false;
     }
 
-    uint32_t extensionCount = 0;
-    XrResult xrResult = xrEnumerateInstanceExtensionProperties(nullptr, 0, &extensionCount, nullptr);
-    if (XR_FAILED(xrResult)) {
-        LogXrResult(XR_NULL_HANDLE, "xrEnumerateInstanceExtensionProperties(count)", xrResult);
-        return false;
-    }
-
-    std::vector<XrExtensionProperties> extensionProperties(
-        extensionCount, XrExtensionProperties{XR_TYPE_EXTENSION_PROPERTIES});
-    xrResult = xrEnumerateInstanceExtensionProperties(
-        nullptr, extensionCount, &extensionCount, extensionProperties.data());
-    if (XR_FAILED(xrResult)) {
-        LogXrResult(XR_NULL_HANDLE, "xrEnumerateInstanceExtensionProperties(list)", xrResult);
-        return false;
-    }
-
-    availableInstanceExtensions_.clear();
-    availableInstanceExtensions_.reserve(extensionProperties.size());
-    for (const auto& extension : extensionProperties) {
-        availableInstanceExtensions_.emplace_back(extension.extensionName);
-    }
-
-    const std::array<const char*, 3> requiredExtensions{
+    const std::array<const char*, 4> enabledExtensions{
         XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
         XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME,
         XR_FB_PASSTHROUGH_EXTENSION_NAME,
+        XR_EXT_HAND_TRACKING_EXTENSION_NAME,
     };
-
-    std::vector<const char*> enabledExtensions(requiredExtensions.begin(), requiredExtensions.end());
-    if (IsInstanceExtensionSupported(XR_EXT_HAND_TRACKING_EXTENSION_NAME)) {
-        enabledExtensions.push_back(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
-        handTrackingSupported_ = true;
-    } else {
-        handTrackingSupported_ = false;
-        LogInfo("XR_EXT_hand_tracking is unavailable; hand overlays disabled.");
-    }
-
-    for (const char* requiredExtension : requiredExtensions) {
-        if (!IsInstanceExtensionSupported(requiredExtension)) {
-            std::ostringstream stream;
-            stream << "Missing required instance extension: " << requiredExtension;
-            LogError(stream.str());
-            return false;
-        }
-    }
 
     XrInstanceCreateInfoAndroidKHR androidCreateInfo{XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
     androidCreateInfo.applicationVM = app_->activity->vm;
@@ -658,7 +334,7 @@ bool QuestPassthroughApp::InitializeOpenXr() {
     createInfo.applicationInfo.applicationVersion = 1;
     createInfo.applicationInfo.engineVersion = 1;
 
-    xrResult = xrCreateInstance(&createInfo, &instance_);
+    XrResult xrResult = xrCreateInstance(&createInfo, &instance_);
     if (XR_FAILED(xrResult)) {
         LogXrResult(XR_NULL_HANDLE, "xrCreateInstance", xrResult);
         return false;
@@ -677,13 +353,11 @@ bool QuestPassthroughApp::InitializeOpenXr() {
         return false;
     }
 
-    if (handTrackingSupported_) {
-        if (!GetInstanceProc("xrCreateHandTrackerEXT", &xrCreateHandTrackerEXT_) ||
-            !GetInstanceProc("xrDestroyHandTrackerEXT", &xrDestroyHandTrackerEXT_) ||
-            !GetInstanceProc("xrLocateHandJointsEXT", &xrLocateHandJointsEXT_)) {
-            LogError("Failed to resolve XR_EXT_hand_tracking function pointers.");
-            return false;
-        }
+    if (!GetInstanceProc("xrCreateHandTrackerEXT", &xrCreateHandTrackerEXT_) ||
+        !GetInstanceProc("xrDestroyHandTrackerEXT", &xrDestroyHandTrackerEXT_) ||
+        !GetInstanceProc("xrLocateHandJointsEXT", &xrLocateHandJointsEXT_)) {
+        LogError("Failed to resolve XR_EXT_hand_tracking function pointers.");
+        return false;
     }
 
     XrSystemGetInfo systemInfo{XR_TYPE_SYSTEM_GET_INFO};
@@ -715,53 +389,26 @@ bool QuestPassthroughApp::InitializeOpenXr() {
         return false;
     }
 
-    if (!ChooseEnvironmentBlendMode()) {
-        return false;
-    }
-
-    if (!InitializeSpaces() || !InitializePassthrough() || !InitializeHudSwapchain()) {
-        return false;
-    }
-
-    if (handTrackingSupported_) {
-        if (!InitializeHandTracking() || !InitializeHandOverlaySwapchain()) {
+    const auto createSpace = [&](XrReferenceSpaceType type, const char* label, XrSpace* space) {
+        XrReferenceSpaceCreateInfo createInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+        createInfo.referenceSpaceType = type;
+        createInfo.poseInReferenceSpace = IdentityPose();
+        const XrResult result = xrCreateReferenceSpace(session_, &createInfo, space);
+        if (XR_FAILED(result)) {
+            LogXrResult(instance_, (std::string("xrCreateReferenceSpace(") + label + ")").c_str(), result);
             return false;
         }
-    }
-
-    telemetry_.localIp = DetectLocalIp();
-    return true;
-}
-
-bool QuestPassthroughApp::InitializeSpaces() {
-    XrReferenceSpaceCreateInfo appSpaceCreateInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
-    appSpaceCreateInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
-    appSpaceCreateInfo.poseInReferenceSpace = IdentityPose();
-
-    XrResult xrResult = xrCreateReferenceSpace(session_, &appSpaceCreateInfo, &appSpace_);
-    if (XR_FAILED(xrResult)) {
-        LogXrResult(instance_, "xrCreateReferenceSpace(local)", xrResult);
+        return true;
+    };
+    if (!createSpace(XR_REFERENCE_SPACE_TYPE_LOCAL, "local", &appSpace_) ||
+        !createSpace(XR_REFERENCE_SPACE_TYPE_VIEW, "view", &viewSpace_)) {
         return false;
     }
 
-    XrReferenceSpaceCreateInfo viewSpaceCreateInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
-    viewSpaceCreateInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
-    viewSpaceCreateInfo.poseInReferenceSpace = IdentityPose();
-
-    xrResult = xrCreateReferenceSpace(session_, &viewSpaceCreateInfo, &viewSpace_);
-    if (XR_FAILED(xrResult)) {
-        LogXrResult(instance_, "xrCreateReferenceSpace(view)", xrResult);
-        return false;
-    }
-
-    return true;
-}
-
-bool QuestPassthroughApp::InitializePassthrough() {
     XrPassthroughCreateInfoFB passthroughCreateInfo{XR_TYPE_PASSTHROUGH_CREATE_INFO_FB};
     passthroughCreateInfo.flags = 0;
 
-    XrResult xrResult = xrCreatePassthroughFB_(session_, &passthroughCreateInfo, &passthrough_);
+    xrResult = xrCreatePassthroughFB_(session_, &passthroughCreateInfo, &passthrough_);
     if (XR_FAILED(xrResult)) {
         LogXrResult(instance_, "xrCreatePassthroughFB", xrResult);
         return false;
@@ -790,218 +437,35 @@ bool QuestPassthroughApp::InitializePassthrough() {
         return false;
     }
 
-    return true;
-}
-
-bool QuestPassthroughApp::InitializeHudSwapchain() {
-    uint32_t formatCount = 0;
-    XrResult xrResult = xrEnumerateSwapchainFormats(session_, 0, &formatCount, nullptr);
-    if (XR_FAILED(xrResult)) {
-        LogXrResult(instance_, "xrEnumerateSwapchainFormats(count)", xrResult);
+    if (!CreateColorSwapchain(session_, instance_, hudWidth_, hudHeight_, "hud", &hudSwapchain_, &hudImages_)) {
         return false;
     }
 
-    std::vector<int64_t> formats(formatCount);
-    xrResult = xrEnumerateSwapchainFormats(session_, formatCount, &formatCount, formats.data());
-    if (XR_FAILED(xrResult)) {
-        LogXrResult(instance_, "xrEnumerateSwapchainFormats(list)", xrResult);
-        return false;
-    }
-
-    const std::array<int64_t, 2> preferredFormats{GL_SRGB8_ALPHA8, GL_RGBA8};
-    auto preferredIt = std::find_first_of(
-        formats.begin(), formats.end(), preferredFormats.begin(), preferredFormats.end());
-    hudSwapchainFormat_ = preferredIt != formats.end() ? *preferredIt : formats.front();
-
-    XrSwapchainCreateInfo swapchainCreateInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
-    swapchainCreateInfo.format = hudSwapchainFormat_;
-    swapchainCreateInfo.sampleCount = 1;
-    swapchainCreateInfo.width = hudWidth_;
-    swapchainCreateInfo.height = hudHeight_;
-    swapchainCreateInfo.faceCount = 1;
-    swapchainCreateInfo.arraySize = 1;
-    swapchainCreateInfo.mipCount = 1;
-    swapchainCreateInfo.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-
-    xrResult = xrCreateSwapchain(session_, &swapchainCreateInfo, &hudSwapchain_);
-    if (XR_FAILED(xrResult)) {
-        LogXrResult(instance_, "xrCreateSwapchain(hud)", xrResult);
-        return false;
-    }
-
-    uint32_t imageCount = 0;
-    xrResult = xrEnumerateSwapchainImages(hudSwapchain_, 0, &imageCount, nullptr);
-    if (XR_FAILED(xrResult)) {
-        LogXrResult(instance_, "xrEnumerateSwapchainImages(count)", xrResult);
-        return false;
-    }
-
-    hudImages_.assign(imageCount, XrSwapchainImageOpenGLESKHR{XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR});
-    xrResult = xrEnumerateSwapchainImages(
-        hudSwapchain_,
-        imageCount,
-        &imageCount,
-        reinterpret_cast<XrSwapchainImageBaseHeader*>(hudImages_.data()));
-    if (XR_FAILED(xrResult)) {
-        LogXrResult(instance_, "xrEnumerateSwapchainImages(list)", xrResult);
-        return false;
-    }
-
-    return true;
-}
-
-bool QuestPassthroughApp::InitializeHandTracking() {
-    XrHandTrackerCreateInfoEXT createInfo{XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT};
-    createInfo.handJointSet = XR_HAND_JOINT_SET_DEFAULT_EXT;
-
-    createInfo.hand = XR_HAND_LEFT_EXT;
-    XrResult xrResult = xrCreateHandTrackerEXT_(session_, &createInfo, &leftHandOverlay_.tracker);
-    if (XR_FAILED(xrResult)) {
-        LogXrResult(instance_, "xrCreateHandTrackerEXT(left)", xrResult);
-        return false;
-    }
-
-    createInfo.hand = XR_HAND_RIGHT_EXT;
-    xrResult = xrCreateHandTrackerEXT_(session_, &createInfo, &rightHandOverlay_.tracker);
-    if (XR_FAILED(xrResult)) {
-        LogXrResult(instance_, "xrCreateHandTrackerEXT(right)", xrResult);
-        return false;
-    }
-
-    return true;
-}
-
-bool QuestPassthroughApp::InitializeHandOverlaySwapchain() {
-    uint32_t formatCount = 0;
-    XrResult xrResult = xrEnumerateSwapchainFormats(session_, 0, &formatCount, nullptr);
-    if (XR_FAILED(xrResult)) {
-        LogXrResult(instance_, "xrEnumerateSwapchainFormats(hand count)", xrResult);
-        return false;
-    }
-
-    std::vector<int64_t> formats(formatCount);
-    xrResult = xrEnumerateSwapchainFormats(session_, formatCount, &formatCount, formats.data());
-    if (XR_FAILED(xrResult)) {
-        LogXrResult(instance_, "xrEnumerateSwapchainFormats(hand list)", xrResult);
-        return false;
-    }
-
-    const std::array<int64_t, 2> preferredFormats{GL_SRGB8_ALPHA8, GL_RGBA8};
-    auto preferredIt = std::find_first_of(
-        formats.begin(), formats.end(), preferredFormats.begin(), preferredFormats.end());
-    const int64_t handFormat = preferredIt != formats.end() ? *preferredIt : formats.front();
-
-    XrSwapchainCreateInfo swapchainCreateInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
-    swapchainCreateInfo.format = handFormat;
-    swapchainCreateInfo.sampleCount = 1;
-    swapchainCreateInfo.width = handOverlayWidth_;
-    swapchainCreateInfo.height = handOverlayHeight_;
-    swapchainCreateInfo.faceCount = 1;
-    swapchainCreateInfo.arraySize = 1;
-    swapchainCreateInfo.mipCount = 1;
-    swapchainCreateInfo.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-
-    xrResult = xrCreateSwapchain(session_, &swapchainCreateInfo, &handOverlaySwapchain_);
-    if (XR_FAILED(xrResult)) {
-        LogXrResult(instance_, "xrCreateSwapchain(hand overlay)", xrResult);
-        return false;
-    }
-
-    uint32_t imageCount = 0;
-    xrResult = xrEnumerateSwapchainImages(handOverlaySwapchain_, 0, &imageCount, nullptr);
-    if (XR_FAILED(xrResult)) {
-        LogXrResult(instance_, "xrEnumerateSwapchainImages(hand count)", xrResult);
-        return false;
-    }
-
-    handOverlayImages_.assign(imageCount, XrSwapchainImageOpenGLESKHR{XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR});
-    xrResult = xrEnumerateSwapchainImages(
-        handOverlaySwapchain_,
-        imageCount,
-        &imageCount,
-        reinterpret_cast<XrSwapchainImageBaseHeader*>(handOverlayImages_.data()));
-    if (XR_FAILED(xrResult)) {
-        LogXrResult(instance_, "xrEnumerateSwapchainImages(hand list)", xrResult);
+    const auto createTracker = [&](XrHandEXT hand, XrHandTrackerEXT* tracker) {
+        XrHandTrackerCreateInfoEXT createInfo{XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT};
+        createInfo.handJointSet = XR_HAND_JOINT_SET_DEFAULT_EXT;
+        createInfo.hand = hand;
+        const XrResult result = xrCreateHandTrackerEXT_(session_, &createInfo, tracker);
+        if (XR_FAILED(result)) {
+            LogXrResult(instance_, hand == XR_HAND_LEFT_EXT ? "xrCreateHandTrackerEXT(left)" : "xrCreateHandTrackerEXT(right)", result);
+            return false;
+        }
+        return true;
+    };
+    if (!createTracker(XR_HAND_LEFT_EXT, &leftHandOverlay_.tracker) ||
+        !createTracker(XR_HAND_RIGHT_EXT, &rightHandOverlay_.tracker) ||
+        !CreateColorSwapchain(session_, instance_, handOverlayWidth_, handOverlayHeight_, "hand overlay", &handOverlaySwapchain_, &handOverlayImages_)) {
         return false;
     }
 
     uint32_t imageIndex = 0;
-    XrSwapchainImageAcquireInfo acquireInfo{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-    xrResult = xrAcquireSwapchainImage(handOverlaySwapchain_, &acquireInfo, &imageIndex);
-    if (XR_FAILED(xrResult)) {
-        LogXrResult(instance_, "xrAcquireSwapchainImage(hand init)", xrResult);
+    if (!AcquireSwapchainImageBlocking(instance_, handOverlaySwapchain_, "hand init", &imageIndex)) {
         return false;
     }
-
-    XrSwapchainImageWaitInfo waitInfo{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-    waitInfo.timeout = XR_INFINITE_DURATION;
-    xrResult = xrWaitSwapchainImage(handOverlaySwapchain_, &waitInfo);
-    if (XR_FAILED(xrResult)) {
-        LogXrResult(instance_, "xrWaitSwapchainImage(hand init)", xrResult);
+    RenderHandOverlayTexture(handOverlayImages_[imageIndex].image, handOverlayWidth_, handOverlayHeight_);
+    if (!ReleaseSwapchainImageChecked(instance_, handOverlaySwapchain_, "hand init")) {
         return false;
     }
-
-    RenderHandOverlayToSwapchain(imageIndex);
-
-    XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-    xrResult = xrReleaseSwapchainImage(handOverlaySwapchain_, &releaseInfo);
-    if (XR_FAILED(xrResult)) {
-        LogXrResult(instance_, "xrReleaseSwapchainImage(hand init)", xrResult);
-        return false;
-    }
-
-    handOverlayTextureInitialized_ = true;
-
-    return true;
-}
-
-bool QuestPassthroughApp::ChooseEnvironmentBlendMode() {
-    uint32_t blendModeCount = 0;
-    XrResult xrResult = xrEnumerateEnvironmentBlendModes(
-        instance_,
-        systemId_,
-        XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
-        0,
-        &blendModeCount,
-        nullptr);
-    if (XR_FAILED(xrResult)) {
-        LogXrResult(instance_, "xrEnumerateEnvironmentBlendModes(count)", xrResult);
-        return false;
-    }
-
-    std::vector<XrEnvironmentBlendMode> blendModes(blendModeCount);
-    xrResult = xrEnumerateEnvironmentBlendModes(
-        instance_,
-        systemId_,
-        XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
-        blendModeCount,
-        &blendModeCount,
-        blendModes.data());
-    if (XR_FAILED(xrResult)) {
-        LogXrResult(instance_, "xrEnumerateEnvironmentBlendModes(list)", xrResult);
-        return false;
-    }
-
-    const auto alphaBlendIt = std::find(
-        blendModes.begin(),
-        blendModes.end(),
-        XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND);
-    if (alphaBlendIt != blendModes.end()) {
-        environmentBlendMode_ = *alphaBlendIt;
-        return true;
-    }
-
-    const auto additiveIt = std::find(
-        blendModes.begin(),
-        blendModes.end(),
-        XR_ENVIRONMENT_BLEND_MODE_ADDITIVE);
-    if (additiveIt != blendModes.end()) {
-        environmentBlendMode_ = *additiveIt;
-        return true;
-    }
-
-    const auto opaqueIt = std::find(blendModes.begin(), blendModes.end(), XR_ENVIRONMENT_BLEND_MODE_OPAQUE);
-    environmentBlendMode_ = opaqueIt != blendModes.end() ? *opaqueIt : blendModes.front();
     return true;
 }
 
@@ -1056,9 +520,7 @@ void QuestPassthroughApp::PollXrEvents(bool* shouldExit) {
 void QuestPassthroughApp::HandleSessionStateChanged(
     const XrEventDataSessionStateChanged& stateChangedEvent,
     bool* shouldExit) {
-    sessionState_ = stateChangedEvent.state;
-
-    switch (sessionState_) {
+    switch (stateChangedEvent.state) {
         case XR_SESSION_STATE_READY: {
             if (!sessionRunning_) {
                 XrSessionBeginInfo beginInfo{XR_TYPE_SESSION_BEGIN_INFO};
@@ -1075,10 +537,7 @@ void QuestPassthroughApp::HandleSessionStateChanged(
         }
         case XR_SESSION_STATE_STOPPING:
             if (sessionRunning_) {
-                const XrResult xrResult = xrEndSession(session_);
-                if (XR_FAILED(xrResult)) {
-                    LogXrResult(instance_, "xrEndSession", xrResult);
-                }
+                xrEndSession(session_);
                 sessionRunning_ = false;
             }
             break;
@@ -1109,118 +568,14 @@ bool QuestPassthroughApp::RenderFrame() {
 
     std::vector<XrCompositionLayerBaseHeader*> layers;
     std::vector<XrCompositionLayerQuad> handLayers;
-    handLayers.reserve(HandOverlayJointSet().size() * 2);
+    handLayers.reserve(kHandOverlayJoints.size() * 2);
 
     if (frameState.shouldRender == XR_TRUE) {
-        UpdateTelemetry(frameState.predictedDisplayTime);
-
-        const std::string hudSnapshot = MakeHudSnapshot();
-        if (!hudTextureInitialized_ || hudSnapshot != lastHudSnapshot_) {
-            uint32_t imageIndex = 0;
-            XrSwapchainImageAcquireInfo acquireInfo{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-            xrResult = xrAcquireSwapchainImage(hudSwapchain_, &acquireInfo, &imageIndex);
-            if (XR_FAILED(xrResult)) {
-                LogXrResult(instance_, "xrAcquireSwapchainImage", xrResult);
-                return false;
-            }
-
-            XrSwapchainImageWaitInfo waitInfo{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-            waitInfo.timeout = XR_INFINITE_DURATION;
-            xrResult = xrWaitSwapchainImage(hudSwapchain_, &waitInfo);
-            if (XR_FAILED(xrResult)) {
-                LogXrResult(instance_, "xrWaitSwapchainImage", xrResult);
-                return false;
-            }
-
-            RenderHudToSwapchain(imageIndex);
-
-            XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-            xrResult = xrReleaseSwapchainImage(hudSwapchain_, &releaseInfo);
-            if (XR_FAILED(xrResult)) {
-                LogXrResult(instance_, "xrReleaseSwapchainImage", xrResult);
-                return false;
-            }
-
-            hudTextureInitialized_ = true;
-            lastHudSnapshot_ = hudSnapshot;
-        }
-
-        if (handTrackingSupported_ && handOverlaySwapchain_ != XR_NULL_HANDLE) {
-            XrHandJointsLocateInfoEXT handLocateInfo{XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT};
-            handLocateInfo.baseSpace = appSpace_;
-            handLocateInfo.time = frameState.predictedDisplayTime;
-
-            const auto locateHand = [&](HandOverlayState* handState) {
-                handState->tracked = false;
-                for (auto& jointState : handState->joints) {
-                    jointState.tracked = false;
-                }
-                if (handState->tracker == XR_NULL_HANDLE) {
-                    return;
-                }
-
-                std::array<XrHandJointLocationEXT, XR_HAND_JOINT_COUNT_EXT> jointLocations{
-                    XrHandJointLocationEXT{}, XrHandJointLocationEXT{}, XrHandJointLocationEXT{}, XrHandJointLocationEXT{},
-                    XrHandJointLocationEXT{}, XrHandJointLocationEXT{}, XrHandJointLocationEXT{}, XrHandJointLocationEXT{},
-                    XrHandJointLocationEXT{}, XrHandJointLocationEXT{}, XrHandJointLocationEXT{}, XrHandJointLocationEXT{},
-                    XrHandJointLocationEXT{}, XrHandJointLocationEXT{}, XrHandJointLocationEXT{}, XrHandJointLocationEXT{},
-                    XrHandJointLocationEXT{}, XrHandJointLocationEXT{}, XrHandJointLocationEXT{}, XrHandJointLocationEXT{},
-                    XrHandJointLocationEXT{}, XrHandJointLocationEXT{}, XrHandJointLocationEXT{}, XrHandJointLocationEXT{},
-                    XrHandJointLocationEXT{}, XrHandJointLocationEXT{}
-                };
-                XrHandJointLocationsEXT locations{XR_TYPE_HAND_JOINT_LOCATIONS_EXT};
-                locations.jointCount = static_cast<uint32_t>(jointLocations.size());
-                locations.jointLocations = jointLocations.data();
-
-                const XrResult locateResult = xrLocateHandJointsEXT_(handState->tracker, &handLocateInfo, &locations);
-                if (XR_FAILED(locateResult) || locations.isActive == XR_FALSE) {
-                    return;
-                }
-
-                handState->tracked = true;
-                size_t trackedJointCount = 0;
-                size_t trackedFingertipCount = 0;
-                for (size_t jointIndex = 0; jointIndex < jointLocations.size(); ++jointIndex) {
-                    auto& jointState = handState->joints[jointIndex];
-                    const XrHandJointLocationEXT& jointLocation = jointLocations[jointIndex];
-                    const bool positionValid =
-                        (jointLocation.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0;
-                    const bool orientationValid =
-                        (jointLocation.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0;
-                    jointState.tracked = positionValid;
-                    if (!jointState.tracked) {
-                        continue;
-                    }
-
-                    trackedJointCount += 1;
-                    jointState.pose = jointLocation.pose;
-                    if (!orientationValid) {
-                        jointState.pose.orientation = XrQuaternionf{0.0f, 0.0f, 0.0f, 1.0f};
-                    }
-                    jointState.radius = std::max(0.0125f, jointLocation.radius * 1.4f);
-
-                    for (const auto& [joint, _name] : FingertipJointSet()) {
-                        if (static_cast<size_t>(joint) == jointIndex) {
-                            trackedFingertipCount += 1;
-                            break;
-                        }
-                    }
-                }
-
-                if ((telemetrySequence_ % kHandDiagnosticsLogEveryFrames) == 0) {
-                    const char* handLabel = handState == &leftHandOverlay_ ? "left" : "right";
-                    LogHandJointDiagnostics(
-                        handLabel,
-                        telemetrySequence_,
-                        jointLocations[XR_HAND_JOINT_WRIST_EXT],
-                        jointLocations[XR_HAND_JOINT_PALM_EXT],
-                        trackedJointCount,
-                        trackedFingertipCount);
-                }
-            };
-
-            locateHand(&leftHandOverlay_);
-            locateHand(&rightHandOverlay_);
+        const HmdPoseState headPose = LocateHeadPose(frameState.predictedDisplayTime);
+        LocateHandJoints(frameState.predictedDisplayTime);
+        UpdateTelemetry(frameState.predictedDisplayTime, headPose);
+        if (!RefreshHudTexture()) {
+            return false;
         }
 
         XrCompositionLayerPassthroughFB passthroughLayer{XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB};
@@ -1247,44 +602,13 @@ bool QuestPassthroughApp::RenderFrame() {
         layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&passthroughLayer));
         layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&hudLayer));
 
-        auto appendHandLayers = [&](const HandOverlayState& handState) {
-            if (!handOverlayTextureInitialized_ || !handState.tracked) {
-                return;
-            }
-
-            for (const XrHandJointEXT joint : HandOverlayJointSet()) {
-                const auto& jointState = handState.joints[static_cast<size_t>(joint)];
-                if (!jointState.tracked) {
-                    continue;
-                }
-
-                handLayers.push_back(XrCompositionLayerQuad{XR_TYPE_COMPOSITION_LAYER_QUAD});
-                XrCompositionLayerQuad& handLayer = handLayers.back();
-                handLayer.layerFlags =
-                    XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
-                    XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
-                handLayer.space = appSpace_;
-                handLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-                handLayer.subImage.swapchain = handOverlaySwapchain_;
-                handLayer.subImage.imageRect.offset = {0, 0};
-                handLayer.subImage.imageRect.extent = {
-                    static_cast<int32_t>(handOverlayWidth_),
-                    static_cast<int32_t>(handOverlayHeight_)};
-                handLayer.subImage.imageArrayIndex = 0;
-                handLayer.pose = jointState.pose;
-                const float diameter = jointState.radius * 2.0f;
-                handLayer.size = {diameter, diameter};
-                layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&handLayer));
-            }
-        };
-
-        appendHandLayers(leftHandOverlay_);
-        appendHandLayers(rightHandOverlay_);
+        AppendHandLayers(leftHandOverlay_, &handLayers, &layers);
+        AppendHandLayers(rightHandOverlay_, &handLayers, &layers);
     }
 
     XrFrameEndInfo frameEndInfo{XR_TYPE_FRAME_END_INFO};
     frameEndInfo.displayTime = frameState.predictedDisplayTime;
-    frameEndInfo.environmentBlendMode = environmentBlendMode_;
+    frameEndInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND;
     frameEndInfo.layerCount = static_cast<uint32_t>(layers.size());
     frameEndInfo.layers = layers.empty() ? nullptr : layers.data();
 
@@ -1297,15 +621,41 @@ bool QuestPassthroughApp::RenderFrame() {
     return true;
 }
 
-void QuestPassthroughApp::UpdateTelemetry(XrTime predictedDisplayTime) {
-    const TransportSelection selection = ReadTransportSelection();
-
-    if (telemetry_.localIp == "LOOKUP") {
-        telemetry_.localIp = DetectLocalIp();
+bool QuestPassthroughApp::RefreshHudTexture() {
+    const TelemetryState& telemetry = transport_.telemetry();
+    const std::string hudSnapshot = BuildHudSnapshot(
+        telemetry.connectionState,
+        telemetry.packetRate,
+        telemetry.trackingValid,
+        telemetry.localIp,
+        telemetry.targetHost);
+    if (hudTextureInitialized_ && hudSnapshot == lastHudSnapshot_) {
+        return true;
     }
 
-    telemetry_.trackingValid = false;
+    uint32_t imageIndex = 0;
+    if (!AcquireSwapchainImageBlocking(instance_, hudSwapchain_, "hud", &imageIndex)) {
+        return false;
+    }
+    RenderHudTexture(
+        hudImages_[imageIndex].image,
+        hudWidth_,
+        hudHeight_,
+        telemetry.connectionState,
+        telemetry.packetRate,
+        telemetry.trackingValid,
+        telemetry.localIp,
+        telemetry.targetHost);
+    if (!ReleaseSwapchainImageChecked(instance_, hudSwapchain_, "hud")) {
+        return false;
+    }
 
+    hudTextureInitialized_ = true;
+    lastHudSnapshot_ = hudSnapshot;
+    return true;
+}
+
+HmdPoseState QuestPassthroughApp::LocateHeadPose(XrTime predictedDisplayTime) {
     HmdPoseState headPose;
     XrSpaceLocation viewLocation{XR_TYPE_SPACE_LOCATION};
     const XrResult locateResult = xrLocateSpace(viewSpace_, appSpace_, predictedDisplayTime, &viewLocation);
@@ -1318,561 +668,173 @@ void QuestPassthroughApp::UpdateTelemetry(XrTime predictedDisplayTime) {
         headPose.valid = (viewLocation.locationFlags & requiredFlags) == requiredFlags;
         headPose.position = viewLocation.pose.position;
         headPose.orientation = viewLocation.pose.orientation;
-        telemetry_.trackingValid = headPose.valid;
     }
-
-    SyncTransportConnection(selection);
-    UpdateTransportTelemetry(selection);
-
-    if (transportSocketConnected_) {
-        const std::vector<uint8_t> packet = SerializeTelemetryPacket(selection, predictedDisplayTime, headPose);
-        if (SendTelemetryPacket(packet)) {
-            NoteSuccessfulPacketSend();
-        }
-    }
-
-    const auto now = std::chrono::steady_clock::now();
-    if (lastSuccessfulSendTime_.time_since_epoch().count() == 0 || now - lastSuccessfulSendTime_ > std::chrono::seconds(1)) {
-        telemetry_.packetRate = 0.0f;
-    }
+    return headPose;
 }
 
-void QuestPassthroughApp::UpdateTransportTelemetry(const TransportSelection& selection) {
-    telemetry_.targetHost = selection.hasEndpoint ? EndpointToString(selection.host, selection.port) : "SEARCHING";
+void QuestPassthroughApp::LocateHandJoints(XrTime predictedDisplayTime) {
+    XrHandJointsLocateInfoEXT handLocateInfo{XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT};
+    handLocateInfo.baseSpace = appSpace_;
+    handLocateInfo.time = predictedDisplayTime;
 
-    if (selection.wiredMode) {
-        telemetry_.connectionState = transportSocketConnected_ ? "WIRED CONNECTED" : "WIRED WAITING";
-        return;
-    }
-
-    if (!selection.hasEndpoint) {
-        telemetry_.connectionState = "WIRELESS SEARCH";
-        return;
-    }
-
-    telemetry_.connectionState = transportSocketConnected_ ? "WIRELESS CONNECTED" : "WIRELESS WAIT";
-}
-
-QuestPassthroughApp::TransportSelection QuestPassthroughApp::ReadTransportSelection() const {
-    std::scoped_lock lock(gTransportSelectionMutex);
-
-    TransportSelection selection;
-    selection.wiredMode = gTransportSelectionState.wiredMode;
-    if (selection.wiredMode) {
-        selection.hasEndpoint = true;
-        selection.host = kWiredLoopbackHost;
-        selection.port = gTransportSelectionState.wiredPort;
-        return selection;
-    }
-
-    selection.hasEndpoint = gTransportSelectionState.wirelessEndpointAvailable;
-    selection.host = gTransportSelectionState.wirelessHost;
-    selection.port = gTransportSelectionState.wirelessPort;
-    return selection;
-}
-
-void QuestPassthroughApp::SyncTransportConnection(const TransportSelection& selection) {
-    const bool selectionChanged =
-        !transportSocketConnected_ ||
-        transportSocketWiredMode_ != selection.wiredMode ||
-        transportHost_ != selection.host ||
-        transportPort_ != selection.port;
-
-    if (!selection.hasEndpoint) {
-        if (transportSocketConnected_) {
-            LogInfo("Transport endpoint unavailable; closing active transport socket.");
-        }
-        CloseTransportConnection();
-        return;
-    }
-
-    if (!selectionChanged) {
-        return;
-    }
-
-    CloseTransportConnection();
-
-    const auto now = std::chrono::steady_clock::now();
-    if (nextReconnectAttempt_.time_since_epoch().count() != 0 && now < nextReconnectAttempt_) {
-        return;
-    }
-
-    if (!OpenTransportConnection(selection)) {
-        nextReconnectAttempt_ = now + kReconnectDelay;
-        return;
-    }
-
-    nextReconnectAttempt_ = std::chrono::steady_clock::time_point{};
-}
-
-bool QuestPassthroughApp::OpenTransportConnection(const TransportSelection& selection) {
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_port = htons(selection.port);
-    if (inet_pton(AF_INET, selection.host.c_str(), &address.sin_addr) != 1) {
-        std::ostringstream stream;
-        stream << "Transport connection failed: invalid address " << selection.host;
-        LogError(stream.str());
-        return false;
-    }
-
-    const int socketType = selection.wiredMode ? SOCK_STREAM : SOCK_DGRAM;
-    const int socketFd = socket(AF_INET, socketType, 0);
-    if (socketFd < 0) {
-        LogError("Transport connection failed: unable to create socket.");
-        return false;
-    }
-
-    if (selection.wiredMode) {
-        const int flags = fcntl(socketFd, F_GETFL, 0);
-        if (flags < 0 || fcntl(socketFd, F_SETFL, flags | O_NONBLOCK) != 0) {
-            close(socketFd);
-            LogError("Transport connection failed: unable to configure non-blocking TCP socket.");
-            return false;
+    const auto locateHand = [&](HandOverlayState* handState) {
+        handState->tracked = false;
+        for (auto& jointState : handState->joints) {
+            jointState.tracked = false;
         }
 
-        const int connectResult = connect(socketFd, reinterpret_cast<const sockaddr*>(&address), sizeof(address));
-        if (connectResult != 0 && errno != EINPROGRESS) {
-            close(socketFd);
-            std::ostringstream stream;
-            stream << "Wired TCP connection failed to " << EndpointToString(selection.host, selection.port)
-                   << " (errno=" << errno << ")";
-            LogError(stream.str());
-            return false;
+        std::array<XrHandJointLocationEXT, XR_HAND_JOINT_COUNT_EXT> jointLocations{};
+        XrHandJointLocationsEXT locations{XR_TYPE_HAND_JOINT_LOCATIONS_EXT};
+        locations.jointCount = static_cast<uint32_t>(jointLocations.size());
+        locations.jointLocations = jointLocations.data();
+
+        const XrResult locateResult = xrLocateHandJointsEXT_(handState->tracker, &handLocateInfo, &locations);
+        if (XR_FAILED(locateResult) || locations.isActive == XR_FALSE) {
+            return;
         }
 
-        if (connectResult != 0) {
-            pollfd pollDescriptor{};
-            pollDescriptor.fd = socketFd;
-            pollDescriptor.events = POLLOUT;
-            const int pollResult = poll(&pollDescriptor, 1, kConnectTimeoutMs);
-            if (pollResult <= 0) {
-                close(socketFd);
-                std::ostringstream stream;
-                stream << "Wired TCP connection timed out for " << EndpointToString(selection.host, selection.port);
-                LogError(stream.str());
-                return false;
-            }
-
-            int socketError = 0;
-            socklen_t socketErrorSize = sizeof(socketError);
-            if (getsockopt(socketFd, SOL_SOCKET, SO_ERROR, &socketError, &socketErrorSize) != 0 || socketError != 0) {
-                close(socketFd);
-                std::ostringstream stream;
-                stream << "Wired TCP connection failed for " << EndpointToString(selection.host, selection.port)
-                       << " (errno=" << socketError << ")";
-                LogError(stream.str());
-                return false;
-            }
-        }
-
-        if (fcntl(socketFd, F_SETFL, flags) != 0) {
-            close(socketFd);
-            LogError("Transport connection failed: unable to restore TCP socket flags.");
-            return false;
-        }
-    } else if (connect(socketFd, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0) {
-        close(socketFd);
-        std::ostringstream stream;
-        stream << "Wireless UDP connection setup failed for " << EndpointToString(selection.host, selection.port)
-               << " (errno=" << errno << ")";
-        LogError(stream.str());
-        return false;
-    }
-
-    transportSocket_ = socketFd;
-    transportSocketConnected_ = true;
-    transportSocketWiredMode_ = selection.wiredMode;
-    transportHost_ = selection.host;
-    transportPort_ = selection.port;
-
-    std::ostringstream stream;
-    stream << (selection.wiredMode ? "Using wired ADB reverse TCP path: " : "Using wireless Avahi UDP path: ")
-           << EndpointToString(selection.host, selection.port);
-    LogInfo(stream.str());
-    return true;
-}
-
-void QuestPassthroughApp::CloseTransportConnection() {
-    if (transportSocket_ >= 0) {
-        close(transportSocket_);
-    }
-    transportSocket_ = -1;
-    transportSocketConnected_ = false;
-    transportSocketWiredMode_ = false;
-    transportHost_.clear();
-    transportPort_ = 0;
-}
-
-bool QuestPassthroughApp::SendTelemetryPacket(const std::vector<uint8_t>& packet) {
-    if (!transportSocketConnected_ || transportSocket_ < 0) {
-        return false;
-    }
-
-    const bool success = transportSocketWiredMode_
-        ? WriteAllToSocket(transportSocket_, packet)
-        : send(transportSocket_, packet.data(), packet.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(packet.size());
-    if (success) {
-        return true;
-    }
-
-    std::ostringstream stream;
-    stream << (transportSocketWiredMode_ ? "Wired TCP send failed for " : "Wireless UDP send failed for ")
-           << EndpointToString(transportHost_, transportPort_)
-           << " (errno=" << errno << ')';
-    LogError(stream.str());
-    CloseTransportConnection();
-    nextReconnectAttempt_ = std::chrono::steady_clock::now() + kReconnectDelay;
-    return false;
-}
-
-std::vector<uint8_t> QuestPassthroughApp::SerializeTelemetryPacket(
-    const TransportSelection& selection,
-    XrTime predictedDisplayTime,
-    const HmdPoseState& headPose) {
-    std::ostringstream payloadStream;
-    payloadStream << std::fixed << std::setprecision(6);
-    const auto appendHandJson = [&](const HandOverlayState& handState) {
-        const auto& wrist = handState.joints[XR_HAND_JOINT_WRIST_EXT];
-        const auto& palm = handState.joints[XR_HAND_JOINT_PALM_EXT];
-
-        payloadStream << '{'
-                      << "\"tracked\":" << (handState.tracked ? "true" : "false") << ','
-                      << "\"wrist\":{";
-        payloadStream << "\"tracked\":" << (wrist.tracked ? "true" : "false");
-        if (wrist.tracked) {
-            payloadStream << ",\"pose\":";
-            AppendPoseJson(payloadStream, wrist.pose);
-        }
-
-        payloadStream << "},\"palm\":{";
-        payloadStream << "\"tracked\":" << (palm.tracked ? "true" : "false");
-        if (palm.tracked) {
-            payloadStream << ",\"pose\":";
-            AppendPoseJson(payloadStream, palm.pose);
-        }
-
-        payloadStream << "},\"fingertips\":{";
-        bool firstFingertip = true;
-        for (const auto& [joint, name] : FingertipJointSet()) {
-            if (!firstFingertip) {
-                payloadStream << ',';
-            }
-            firstFingertip = false;
-
-            const auto& jointState = handState.joints[joint];
-            payloadStream << '"' << name << "\":{";
-            payloadStream << "\"tracked\":" << (jointState.tracked ? "true" : "false");
-            if (jointState.tracked) {
-                payloadStream << ",\"pose\":";
-                AppendPoseJson(payloadStream, jointState.pose);
-                payloadStream << ",\"radius\":" << jointState.radius;
-            }
-            payloadStream << '}';
-        }
-        payloadStream << "}}";
-    };
-
-    payloadStream << '{'
-                  << "\"type\":\"quest_telemetry\","
-                  << "\"version\":1,"
-                  << "\"sequence\":" << telemetrySequence_++ << ','
-                  << "\"transport\":\"" << (selection.wiredMode ? "wired" : "wireless") << "\","
-                  << "\"display_time_ns\":" << static_cast<long long>(predictedDisplayTime) << ','
-                  << "\"tracking_valid\":" << (telemetry_.trackingValid ? "true" : "false") << ','
-                  << "\"head_pose\":{"
-                  << "\"valid\":" << (headPose.valid ? "true" : "false") << ','
-                  << "\"position\":";
-    AppendVector3Json(payloadStream, headPose.position);
-    payloadStream << ",\"orientation\":";
-    AppendQuaternionJson(payloadStream, headPose.orientation);
-    payloadStream << "},\"hands\":{";
-    payloadStream << "\"left\":";
-    appendHandJson(leftHandOverlay_);
-    payloadStream << ",\"right\":";
-    appendHandJson(rightHandOverlay_);
-    payloadStream << "},\"status\":{";
-    payloadStream << "\"connection_state\":\"" << JsonEscape(telemetry_.connectionState) << "\",";
-    payloadStream << "\"target_host\":\"" << JsonEscape(telemetry_.targetHost) << "\"}}";
-
-    const std::string payload = payloadStream.str();
-    const uint32_t payloadSize = static_cast<uint32_t>(payload.size());
-    std::vector<uint8_t> packet(4 + payloadSize);
-    packet[0] = static_cast<uint8_t>((payloadSize >> 24) & 0xff);
-    packet[1] = static_cast<uint8_t>((payloadSize >> 16) & 0xff);
-    packet[2] = static_cast<uint8_t>((payloadSize >> 8) & 0xff);
-    packet[3] = static_cast<uint8_t>(payloadSize & 0xff);
-    std::memcpy(packet.data() + 4, payload.data(), payloadSize);
-    return packet;
-}
-
-void QuestPassthroughApp::NoteSuccessfulPacketSend() {
-    const auto now = std::chrono::steady_clock::now();
-    if (packetWindowStart_.time_since_epoch().count() == 0) {
-        packetWindowStart_ = now;
-        packetWindowCount_ = 0;
-    }
-
-    ++packetWindowCount_;
-    lastSuccessfulSendTime_ = now;
-
-    const std::chrono::duration<float> elapsed = now - packetWindowStart_;
-    if (elapsed.count() >= 1.0f) {
-        telemetry_.packetRate = static_cast<float>(packetWindowCount_) / elapsed.count();
-        packetWindowStart_ = now;
-        packetWindowCount_ = 0;
-    }
-}
-
-void QuestPassthroughApp::RenderHudToSwapchain(uint32_t imageIndex) {
-    std::vector<uint8_t> pixels(static_cast<size_t>(hudWidth_) * hudHeight_ * 4, 0);
-
-    const int panelX = 16;
-    const int panelY = 16;
-    const int panelWidth = static_cast<int>(hudWidth_) - 32;
-    const int panelHeight = static_cast<int>(hudHeight_) - 32;
-    const int titleScale = 4;
-    const int contentScale = 3;
-    const int leftLabelX = 40;
-    const int leftValueX = 280;
-    const int rightLabelX = 760;
-    const int rightValueX = 1020;
-
-    DrawFilledRect(pixels, hudWidth_, hudHeight_, panelX, panelY, panelWidth, panelHeight, 8, 10, 18, 196);
-    DrawFilledRect(pixels, hudWidth_, hudHeight_, panelX, panelY, panelWidth, 4, 0, 176, 255, 220);
-
-    DrawText(pixels, hudWidth_, hudHeight_, 40, 34, titleScale, "META READER", 255, 255, 255, 255);
-
-    std::ostringstream packetRateStream;
-    packetRateStream << std::fixed << std::setprecision(1) << telemetry_.packetRate << " PPS";
-
-    const std::string trackingText = telemetry_.trackingValid ? "VALID" : "INVALID";
-    const bool connected = telemetry_.connectionState.find("CONNECTED") != std::string::npos;
-
-    DrawText(pixels, hudWidth_, hudHeight_, leftLabelX, 90, contentScale, "CONNECTION:", 130, 180, 255, 255);
-    DrawText(
-        pixels,
-        hudWidth_,
-        hudHeight_,
-        leftValueX,
-        90,
-        contentScale,
-        telemetry_.connectionState,
-        connected ? 64 : 255,
-        connected ? 255 : 88,
-        connected ? 128 : 88,
-        255);
-
-    DrawText(pixels, hudWidth_, hudHeight_, leftLabelX, 126, contentScale, "PACKET RATE:", 130, 180, 255, 255);
-    DrawText(pixels, hudWidth_, hudHeight_, leftValueX, 126, contentScale, packetRateStream.str(), 255, 255, 255, 255);
-
-    DrawText(pixels, hudWidth_, hudHeight_, leftLabelX, 162, contentScale, "TRACKING:", 130, 180, 255, 255);
-    DrawText(
-        pixels,
-        hudWidth_,
-        hudHeight_,
-        leftValueX,
-        162,
-        contentScale,
-        trackingText,
-        telemetry_.trackingValid ? 64 : 255,
-        telemetry_.trackingValid ? 255 : 88,
-        telemetry_.trackingValid ? 128 : 88,
-        255);
-
-    DrawText(pixels, hudWidth_, hudHeight_, rightLabelX, 90, contentScale, "LOCAL IP:", 130, 180, 255, 255);
-    DrawText(pixels, hudWidth_, hudHeight_, rightValueX, 90, contentScale, telemetry_.localIp, 255, 255, 255, 255);
-
-    DrawText(pixels, hudWidth_, hudHeight_, rightLabelX, 126, contentScale, "TARGET HOST:", 130, 180, 255, 255);
-    DrawText(pixels, hudWidth_, hudHeight_, rightValueX, 126, contentScale, telemetry_.targetHost, 255, 255, 255, 255);
-
-    std::vector<uint8_t> uploadPixels(pixels.size());
-    const size_t rowBytes = static_cast<size_t>(hudWidth_) * 4;
-    for (uint32_t row = 0; row < hudHeight_; ++row) {
-        const size_t srcOffset = static_cast<size_t>(row) * rowBytes;
-        const size_t dstOffset = static_cast<size_t>(hudHeight_ - 1 - row) * rowBytes;
-        std::memcpy(uploadPixels.data() + dstOffset, pixels.data() + srcOffset, rowBytes);
-    }
-
-    glBindTexture(GL_TEXTURE_2D, hudImages_[imageIndex].image);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexSubImage2D(
-        GL_TEXTURE_2D,
-        0,
-        0,
-        0,
-        static_cast<GLsizei>(hudWidth_),
-        static_cast<GLsizei>(hudHeight_),
-        GL_RGBA,
-        GL_UNSIGNED_BYTE,
-        uploadPixels.data());
-    glBindTexture(GL_TEXTURE_2D, 0);
-    glFlush();
-}
-
-void QuestPassthroughApp::RenderHandOverlayToSwapchain(uint32_t imageIndex) {
-    std::vector<uint8_t> pixels(static_cast<size_t>(handOverlayWidth_) * handOverlayHeight_ * 4, 0);
-    const float centerX = static_cast<float>(handOverlayWidth_) * 0.5f;
-    const float centerY = static_cast<float>(handOverlayHeight_) * 0.5f;
-    const float outerRadius = static_cast<float>(handOverlayWidth_) * 0.42f;
-    const float innerRadius = static_cast<float>(handOverlayWidth_) * 0.24f;
-
-    for (uint32_t y = 0; y < handOverlayHeight_; ++y) {
-        for (uint32_t x = 0; x < handOverlayWidth_; ++x) {
-            const float dx = static_cast<float>(x) - centerX;
-            const float dy = static_cast<float>(y) - centerY;
-            const float distance = std::sqrt(dx * dx + dy * dy);
-            if (distance > outerRadius) {
+        handState->tracked = true;
+        for (size_t jointIndex = 0; jointIndex < jointLocations.size(); ++jointIndex) {
+            auto& jointState = handState->joints[jointIndex];
+            const XrHandJointLocationEXT& jointLocation = jointLocations[jointIndex];
+            const bool positionValid =
+                (jointLocation.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0;
+            jointState.tracked = positionValid;
+            if (!positionValid) {
                 continue;
             }
 
-            const size_t index = (static_cast<size_t>(y) * handOverlayWidth_ + static_cast<size_t>(x)) * 4;
-            if (distance >= innerRadius) {
-                pixels[index + 0] = 0;
-                pixels[index + 1] = 220;
-                pixels[index + 2] = 255;
-                pixels[index + 3] = 224;
-            } else {
-                pixels[index + 0] = 0;
-                pixels[index + 1] = 120;
-                pixels[index + 2] = 255;
-                pixels[index + 3] = 72;
+            jointState.pose = jointLocation.pose;
+            if ((jointLocation.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) == 0) {
+                jointState.pose.orientation = XrQuaternionf{0.0f, 0.0f, 0.0f, 1.0f};
             }
+            jointState.radius = std::max(0.0125f, jointLocation.radius * 1.4f);
         }
-    }
+    };
 
-    glBindTexture(GL_TEXTURE_2D, handOverlayImages_[imageIndex].image);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexSubImage2D(
-        GL_TEXTURE_2D,
-        0,
-        0,
-        0,
-        static_cast<GLsizei>(handOverlayWidth_),
-        static_cast<GLsizei>(handOverlayHeight_),
-        GL_RGBA,
-        GL_UNSIGNED_BYTE,
-        pixels.data());
-    glBindTexture(GL_TEXTURE_2D, 0);
-    glFlush();
+    locateHand(&leftHandOverlay_);
+    locateHand(&rightHandOverlay_);
 }
 
-std::string QuestPassthroughApp::MakeHudSnapshot() const {
-    std::ostringstream stream;
-    stream << telemetry_.connectionState << '|'
-           << std::fixed << std::setprecision(1) << telemetry_.packetRate << '|'
-           << (telemetry_.trackingValid ? '1' : '0') << '|'
-           << telemetry_.localIp << '|'
-           << telemetry_.targetHost;
-    return stream.str();
+HandTelemetryState QuestPassthroughApp::BuildHandTelemetry(const HandOverlayState& handState) const {
+    const auto copyPose = [](const HandJointVisualState& source) {
+        TrackedPoseState pose;
+        pose.tracked = source.tracked;
+        pose.pose = source.pose;
+        pose.radius = source.radius;
+        return pose;
+    };
+
+    HandTelemetryState handTelemetry;
+    handTelemetry.tracked = handState.tracked;
+    handTelemetry.wrist = copyPose(handState.joints[XR_HAND_JOINT_WRIST_EXT]);
+    handTelemetry.palm = copyPose(handState.joints[XR_HAND_JOINT_PALM_EXT]);
+    for (size_t index = 0; index < kFingertipJoints.size(); ++index) {
+        handTelemetry.fingertips[index] = copyPose(handState.joints[kFingertipJoints[index].first]);
+    }
+    return handTelemetry;
 }
 
-std::string QuestPassthroughApp::DetectLocalIp() const {
-    ifaddrs* interfaces = nullptr;
-    if (getifaddrs(&interfaces) != 0 || interfaces == nullptr) {
-        return "UNAVAILABLE";
+void QuestPassthroughApp::AppendHandLayers(
+    const HandOverlayState& handState,
+    std::vector<XrCompositionLayerQuad>* handLayers,
+    std::vector<XrCompositionLayerBaseHeader*>* layers) const {
+    if (!handState.tracked) {
+        return;
     }
 
-    std::string result = "UNAVAILABLE";
-    for (ifaddrs* interface = interfaces; interface != nullptr; interface = interface->ifa_next) {
-        if (interface->ifa_addr == nullptr || interface->ifa_addr->sa_family != AF_INET) {
-            continue;
-        }
-        if ((interface->ifa_flags & IFF_LOOPBACK) != 0) {
+    for (const XrHandJointEXT joint : kHandOverlayJoints) {
+        const auto& jointState = handState.joints[static_cast<size_t>(joint)];
+        if (!jointState.tracked) {
             continue;
         }
 
-        char buffer[INET_ADDRSTRLEN]{};
-        const auto* address = reinterpret_cast<const sockaddr_in*>(interface->ifa_addr);
-        if (inet_ntop(AF_INET, &address->sin_addr, buffer, sizeof(buffer)) != nullptr) {
-            result = buffer;
-            break;
-        }
+        handLayers->push_back(XrCompositionLayerQuad{XR_TYPE_COMPOSITION_LAYER_QUAD});
+        XrCompositionLayerQuad& handLayer = handLayers->back();
+        handLayer.layerFlags =
+            XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
+            XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+        handLayer.space = appSpace_;
+        handLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+        handLayer.subImage.swapchain = handOverlaySwapchain_;
+        handLayer.subImage.imageRect.offset = {0, 0};
+        handLayer.subImage.imageRect.extent = {
+            static_cast<int32_t>(handOverlayWidth_),
+            static_cast<int32_t>(handOverlayHeight_)};
+        handLayer.subImage.imageArrayIndex = 0;
+        handLayer.pose = jointState.pose;
+        const float diameter = jointState.radius * 2.0f;
+        handLayer.size = {diameter, diameter};
+        layers->push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&handLayer));
     }
-
-    freeifaddrs(interfaces);
-    return result;
 }
 
-bool QuestPassthroughApp::IsInstanceExtensionSupported(const char* extensionName) const {
-    return std::any_of(
-        availableInstanceExtensions_.begin(),
-        availableInstanceExtensions_.end(),
-        [&](const std::string& availableExtension) {
-            return availableExtension == extensionName;
-        });
+void QuestPassthroughApp::UpdateTelemetry(XrTime predictedDisplayTime, const HmdPoseState& headPose) {
+    const TransportSelection selection = transport_.ReadSelection();
+    transport_.telemetry().trackingValid = headPose.valid;
+    transport_.SyncConnection(selection);
+    transport_.UpdateStatus(selection);
+
+    const std::vector<uint8_t> packet = transport_.SerializePacket(
+        selection,
+        predictedDisplayTime,
+        headPose,
+        BuildHandTelemetry(leftHandOverlay_),
+        BuildHandTelemetry(rightHandOverlay_));
+    if (transport_.SendPacket(packet)) {
+        transport_.NoteSuccessfulPacketSend();
+    }
+    transport_.ResetPacketRateIfStale();
 }
 
 void QuestPassthroughApp::Shutdown() {
     if (!initialized_ && instance_ == XR_NULL_HANDLE && eglDisplay_ == EGL_NO_DISPLAY) {
         return;
     }
-
-    CloseTransportConnection();
     ShutdownOpenXr();
     ShutdownEgl();
     initialized_ = false;
 }
 
 void QuestPassthroughApp::ShutdownOpenXr() {
-    if (leftHandOverlay_.tracker != XR_NULL_HANDLE && xrDestroyHandTrackerEXT_ != nullptr) {
-        xrDestroyHandTrackerEXT_(leftHandOverlay_.tracker);
-        leftHandOverlay_.tracker = XR_NULL_HANDLE;
-    }
-    if (rightHandOverlay_.tracker != XR_NULL_HANDLE && xrDestroyHandTrackerEXT_ != nullptr) {
-        xrDestroyHandTrackerEXT_(rightHandOverlay_.tracker);
-        rightHandOverlay_.tracker = XR_NULL_HANDLE;
-    }
+    const auto destroyTracker = [&](XrHandTrackerEXT& tracker) {
+        if (tracker != XR_NULL_HANDLE) {
+            xrDestroyHandTrackerEXT_(tracker);
+            tracker = XR_NULL_HANDLE;
+        }
+    };
+    const auto destroySwapchain = [&](XrSwapchain& swapchain, std::vector<XrSwapchainImageOpenGLESKHR>& images) {
+        if (swapchain != XR_NULL_HANDLE) {
+            xrDestroySwapchain(swapchain);
+            swapchain = XR_NULL_HANDLE;
+        }
+        images.clear();
+    };
+    const auto destroySpace = [&](XrSpace& space) {
+        if (space != XR_NULL_HANDLE) {
+            xrDestroySpace(space);
+            space = XR_NULL_HANDLE;
+        }
+    };
 
-    if (handOverlaySwapchain_ != XR_NULL_HANDLE) {
-        xrDestroySwapchain(handOverlaySwapchain_);
-        handOverlaySwapchain_ = XR_NULL_HANDLE;
-    }
-    handOverlayImages_.clear();
+    destroyTracker(leftHandOverlay_.tracker);
+    destroyTracker(rightHandOverlay_.tracker);
+    destroySwapchain(handOverlaySwapchain_, handOverlayImages_);
 
     if (passthroughLayer_ != XR_NULL_HANDLE) {
-        if (xrPassthroughLayerPauseFB_ != nullptr) {
-            xrPassthroughLayerPauseFB_(passthroughLayer_);
-        }
-        if (xrDestroyPassthroughLayerFB_ != nullptr) {
-            xrDestroyPassthroughLayerFB_(passthroughLayer_);
-        }
+        xrPassthroughLayerPauseFB_(passthroughLayer_);
+        xrDestroyPassthroughLayerFB_(passthroughLayer_);
         passthroughLayer_ = XR_NULL_HANDLE;
     }
-
     if (passthrough_ != XR_NULL_HANDLE) {
-        if (xrPassthroughPauseFB_ != nullptr) {
-            xrPassthroughPauseFB_(passthrough_);
-        }
-        if (xrDestroyPassthroughFB_ != nullptr) {
-            xrDestroyPassthroughFB_(passthrough_);
-        }
+        xrPassthroughPauseFB_(passthrough_);
+        xrDestroyPassthroughFB_(passthrough_);
         passthrough_ = XR_NULL_HANDLE;
     }
 
-    if (hudSwapchain_ != XR_NULL_HANDLE) {
-        xrDestroySwapchain(hudSwapchain_);
-        hudSwapchain_ = XR_NULL_HANDLE;
-    }
-    hudImages_.clear();
-
-    if (viewSpace_ != XR_NULL_HANDLE) {
-        xrDestroySpace(viewSpace_);
-        viewSpace_ = XR_NULL_HANDLE;
-    }
-    if (appSpace_ != XR_NULL_HANDLE) {
-        xrDestroySpace(appSpace_);
-        appSpace_ = XR_NULL_HANDLE;
-    }
-
+    destroySwapchain(hudSwapchain_, hudImages_);
+    destroySpace(viewSpace_);
+    destroySpace(appSpace_);
     if (session_ != XR_NULL_HANDLE) {
         if (sessionRunning_) {
             xrEndSession(session_);
@@ -1881,7 +843,6 @@ void QuestPassthroughApp::ShutdownOpenXr() {
         xrDestroySession(session_);
         session_ = XR_NULL_HANDLE;
     }
-
     if (instance_ != XR_NULL_HANDLE) {
         xrDestroyInstance(instance_);
         instance_ = XR_NULL_HANDLE;
@@ -1893,77 +854,26 @@ Java_com_example_metareader_MetaReaderActivity_nativeOnTransportModeChanged(
     JNIEnv* env,
     jclass /* clazz */,
     jstring mode,
-    jstring detail,
     jint wiredPort) {
     const std::string modeText = JStringToUtf8(env, mode);
-    const std::string detailText = JStringToUtf8(env, detail);
     const bool wiredMode = modeText == "WIRED";
-    SetTransportModeSelection(wiredMode, static_cast<uint16_t>(wiredPort), detailText);
-
-    std::ostringstream stream;
-    stream << "Transport mode changed: " << (wiredMode ? "wired ADB reverse TCP" : "wireless Avahi DNS-SD");
-    if (!detailText.empty()) {
-        stream << " (" << detailText << ')';
-    }
-    LogInfo(stream.str());
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_com_example_metareader_MetaReaderActivity_nativeOnDiscoveryState(
-    JNIEnv* env,
-    jclass /* clazz */,
-    jstring state,
-    jstring detail) {
-    const std::string stateText = JStringToUtf8(env, state);
-    const std::string detailText = JStringToUtf8(env, detail);
-
-    std::ostringstream stream;
-    stream << "Service discovery state: " << (stateText.empty() ? "DISCOVERING" : stateText);
-    if (!detailText.empty()) {
-        stream << " (" << detailText << ")";
-    }
-    LogInfo(stream.str());
+    TransportTelemetryBridge::SetTransportModeSelection(wiredMode, static_cast<uint16_t>(wiredPort));
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_example_metareader_MetaReaderActivity_nativeOnServiceResolved(
     JNIEnv* env,
     jclass /* clazz */,
-    jstring serviceName,
     jstring host,
-    jint port,
-    jstring txtSummary) {
-    const std::string serviceNameText = JStringToUtf8(env, serviceName);
-    const std::string hostText = JStringToUtf8(env, host);
-    const std::string txtSummaryText = JStringToUtf8(env, txtSummary);
-
-    std::ostringstream endpointStream;
-    endpointStream << hostText;
-    if (port > 0) {
-        endpointStream << ':' << port;
-    }
-
-    SetWirelessEndpointSelection(hostText, static_cast<uint16_t>(port), serviceNameText);
-
-    std::ostringstream stream;
-    stream << "Resolved service " << serviceNameText << " -> " << endpointStream.str();
-    if (!txtSummaryText.empty()) {
-        stream << " [" << txtSummaryText << ']';
-    }
-    LogInfo(stream.str());
+    jint port) {
+    TransportTelemetryBridge::SetWirelessEndpointSelection(JStringToUtf8(env, host), static_cast<uint16_t>(port));
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_example_metareader_MetaReaderActivity_nativeOnServiceLost(
-    JNIEnv* env,
-    jclass /* clazz */,
-    jstring serviceName) {
-    const std::string serviceNameText = JStringToUtf8(env, serviceName);
-    ClearWirelessEndpointSelection(serviceNameText);
-
-    std::ostringstream stream;
-    stream << "Lost service " << serviceNameText;
-    LogInfo(stream.str());
+    JNIEnv* /* env */,
+    jclass /* clazz */) {
+    TransportTelemetryBridge::ClearWirelessEndpointSelection();
 }
 
 void QuestPassthroughApp::ShutdownEgl() {

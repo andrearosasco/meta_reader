@@ -79,6 +79,11 @@ class PacketDecoder:
         return packets
 
 
+def _float_tuple(values: list[Any], size: int, default: list[float]) -> tuple[float, ...]:
+    padded = list(values)[:size] + default[len(values[:size]):size]
+    return tuple(float(value) for value in padded)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Listen for Quest telemetry and expose it through a simple MetaReader API.")
     parser.add_argument("--bind-host", default="0.0.0.0", help="Bind host for the active listener. Default: 0.0.0.0")
@@ -94,16 +99,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _make_pose(data: dict[str, Any], valid_key: str = "valid") -> Pose:
-    position = data.get("position", [0.0, 0.0, 0.0])
-    orientation = data.get("orientation", [0.0, 0.0, 0.0, 1.0])
     return Pose(
-        position=(float(position[0]), float(position[1]), float(position[2])),
-        orientation=(
-            float(orientation[0]),
-            float(orientation[1]),
-            float(orientation[2]),
-            float(orientation[3]),
-        ),
+        position=_float_tuple(data.get("position", [0.0, 0.0, 0.0]), 3, [0.0, 0.0, 0.0]),
+        orientation=_float_tuple(data.get("orientation", [0.0, 0.0, 0.0, 1.0]), 4, [0.0, 0.0, 0.0, 1.0]),
         valid=bool(data.get(valid_key, False)),
     )
 
@@ -111,21 +109,9 @@ def _make_pose(data: dict[str, Any], valid_key: str = "valid") -> Pose:
 def _make_joint(data: dict[str, Any]) -> JointState:
     tracked = bool(data.get("tracked", False))
     if tracked:
-        pose_data = data.get("pose", {})
-        pose = Pose(
-            position=(
-                float(pose_data.get("position", [0.0, 0.0, 0.0])[0]),
-                float(pose_data.get("position", [0.0, 0.0, 0.0])[1]),
-                float(pose_data.get("position", [0.0, 0.0, 0.0])[2]),
-            ),
-            orientation=(
-                float(pose_data.get("orientation", [0.0, 0.0, 0.0, 1.0])[0]),
-                float(pose_data.get("orientation", [0.0, 0.0, 0.0, 1.0])[1]),
-                float(pose_data.get("orientation", [0.0, 0.0, 0.0, 1.0])[2]),
-                float(pose_data.get("orientation", [0.0, 0.0, 0.0, 1.0])[3]),
-            ),
-            valid=True,
-        )
+        pose_data = dict(data.get("pose", {}))
+        pose_data["valid"] = True
+        pose = _make_pose(pose_data)
     else:
         pose = None
     radius = data.get("radius")
@@ -275,7 +261,6 @@ class MetaReader:
         self.selector = selectors.DefaultSelector()
         self.publisher: subprocess.Popen[str] | None = None
         self.pending_frames: deque[TelemetryFrame] = deque()
-        self.tcp_decoders: dict[socket.socket, PacketDecoder] = {}
         self.adb_binary = shutil.which("adb")
         self.reverse_configured = False
         self.mode = self._select_mode()
@@ -324,10 +309,18 @@ class MetaReader:
         self.close()
 
     def read(self, timeout: float | None = None) -> TelemetryFrame | None:
+        return self._read_frame(timeout, latest=False)
+
+    def read_latest(self, timeout: float | None = None) -> TelemetryFrame | None:
+        return self._read_frame(timeout, latest=True)
+
+    def _read_frame(self, timeout: float | None, *, latest: bool) -> TelemetryFrame | None:
+        pop_frame = self._pop_latest_pending if latest else self.pending_frames.popleft
         if self.pending_frames:
-            return self.pending_frames.popleft()
+            return pop_frame()
 
         deadline = None if timeout is None else time.monotonic() + timeout
+        frame = None
         while True:
             remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
             if deadline is not None and remaining == 0.0:
@@ -339,40 +332,23 @@ class MetaReader:
 
             for key, _ in events:
                 self._handle_event(key)
-                if self.pending_frames:
-                    return self.pending_frames.popleft()
 
-    def read_latest(self, timeout: float | None = None) -> TelemetryFrame | None:
-        latest = self._pop_latest_pending()
-        if latest is None:
-            deadline = None if timeout is None else time.monotonic() + timeout
+            if self.pending_frames:
+                frame = pop_frame()
+                if not latest:
+                    return frame
+
+            if not latest:
+                continue
+
             while True:
-                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-                if deadline is not None and remaining == 0.0:
-                    return None
-
-                events = self.selector.select(timeout=remaining)
+                events = self.selector.select(timeout=0.0)
                 if not events:
-                    return None
-
+                    return frame
                 for key, _ in events:
                     self._handle_event(key)
-
-                latest = self._pop_latest_pending()
-                if latest is not None:
-                    break
-
-        while True:
-            events = self.selector.select(timeout=0.0)
-            if not events:
-                return latest
-
-            for key, _ in events:
-                self._handle_event(key)
-
-            newest = self._pop_latest_pending()
-            if newest is not None:
-                latest = newest
+                if self.pending_frames:
+                    frame = self._pop_latest_pending()
 
     def _pop_latest_pending(self) -> TelemetryFrame | None:
         if not self.pending_frames:
@@ -395,7 +371,6 @@ class MetaReader:
             client_socket, address = key.fileobj.accept()
             client_socket.setblocking(False)
             client_decoder = PacketDecoder()
-            self.tcp_decoders[client_socket] = client_decoder
             self.selector.register(client_socket, selectors.EVENT_READ, ("tcp-client", client_decoder, address))
             return
 
@@ -403,12 +378,10 @@ class MetaReader:
         payload = key.fileobj.recv(65535)
         if not payload:
             self.selector.unregister(key.fileobj)
-            self.tcp_decoders.pop(key.fileobj, None)
             key.fileobj.close()
             return
 
-        for packet in client_decoder.feed(payload):
-            self.pending_frames.append(parse_frame(packet))
+        self.pending_frames.extend(parse_frame(packet) for packet in client_decoder.feed(payload))
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -23,8 +23,10 @@ find_library(gles-lib GLESv3)
 add_library(
     meta_reader
     SHARED
+    hud_renderer.cpp
     main.cpp
     quest_passthrough_app.cpp
+    transport_telemetry.cpp
 )
 
 target_compile_features(meta_reader PRIVATE cxx_std_20)
