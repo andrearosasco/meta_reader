@@ -4,8 +4,13 @@
 #include <android/log.h>
 #include <arpa/inet.h>
 #include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <ifaddrs.h>
 #include <net/if.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -21,6 +26,11 @@
 namespace {
 
 constexpr const char* kLogTag = "MetaReaderXR";
+constexpr const char* kWiredLoopbackHost = "127.0.0.1";
+constexpr uint16_t kDefaultWiredLoopbackPort = 5005;
+constexpr auto kReconnectDelay = std::chrono::milliseconds(1000);
+constexpr int kConnectTimeoutMs = 150;
+constexpr uint64_t kHandDiagnosticsLogEveryFrames = 180;
 
 #ifndef EGL_OPENGL_ES3_BIT_KHR
 #define EGL_OPENGL_ES3_BIT_KHR 0x00000040
@@ -34,14 +44,37 @@ void LogError(const std::string& message) {
     __android_log_write(ANDROID_LOG_ERROR, kLogTag, message.c_str());
 }
 
-struct DiscoveryTelemetryState {
-    std::string connectionState{"DISCOVERING"};
-    std::string targetHost{"SEARCHING"};
+void LogHandJointDiagnostics(
+    const char* handLabel,
+    uint64_t frameSequence,
+    const XrHandJointLocationEXT& wrist,
+    const XrHandJointLocationEXT& palm,
+    size_t trackedJointCount,
+    size_t trackedFingertipCount) {
+    std::ostringstream stream;
+    stream << "Hand diagnostics [" << handLabel << "] seq=" << frameSequence
+           << " tracked_joints=" << trackedJointCount
+           << " tracked_fingertips=" << trackedFingertipCount
+           << " wrist_flags=0x" << std::hex << static_cast<uint64_t>(wrist.locationFlags)
+           << " palm_flags=0x" << static_cast<uint64_t>(palm.locationFlags)
+           << std::dec
+           << " wrist_radius=" << wrist.radius
+           << " palm_radius=" << palm.radius;
+    LogInfo(stream.str());
+}
+
+struct TransportSelectionState {
+    bool wiredMode{false};
+    uint16_t wiredPort{kDefaultWiredLoopbackPort};
+    bool wirelessEndpointAvailable{false};
+    std::string wirelessHost;
+    uint16_t wirelessPort{0};
     std::string serviceName;
+    std::string detail;
 };
 
-std::mutex gDiscoveryTelemetryMutex;
-DiscoveryTelemetryState gDiscoveryTelemetryState;
+std::mutex gTransportSelectionMutex;
+TransportSelectionState gTransportSelectionState;
 
 std::string JStringToUtf8(JNIEnv* env, jstring value) {
     if (value == nullptr) {
@@ -58,14 +91,65 @@ std::string JStringToUtf8(JNIEnv* env, jstring value) {
     return text;
 }
 
-void SetDiscoveryTelemetryState(
-    const std::string& connectionState,
-    const std::string& targetHost,
+std::string EndpointToString(const std::string& host, uint16_t port) {
+    if (host.empty()) {
+        return "SEARCHING";
+    }
+
+    std::ostringstream stream;
+    stream << host;
+    if (port > 0) {
+        stream << ':' << port;
+    }
+    return stream.str();
+}
+
+void SetTransportModeSelection(bool wiredMode, uint16_t wiredPort, const std::string& detail) {
+    std::scoped_lock lock(gTransportSelectionMutex);
+    gTransportSelectionState.wiredMode = wiredMode;
+    gTransportSelectionState.wiredPort = wiredPort > 0 ? wiredPort : kDefaultWiredLoopbackPort;
+    gTransportSelectionState.detail = detail;
+    if (wiredMode) {
+        gTransportSelectionState.wirelessEndpointAvailable = false;
+        gTransportSelectionState.wirelessHost.clear();
+        gTransportSelectionState.wirelessPort = 0;
+        gTransportSelectionState.serviceName.clear();
+    }
+}
+
+void SetWirelessEndpointSelection(
+    const std::string& host,
+    uint16_t port,
     const std::string& serviceName) {
-    std::scoped_lock lock(gDiscoveryTelemetryMutex);
-    gDiscoveryTelemetryState.connectionState = connectionState;
-    gDiscoveryTelemetryState.targetHost = targetHost;
-    gDiscoveryTelemetryState.serviceName = serviceName;
+    std::scoped_lock lock(gTransportSelectionMutex);
+    gTransportSelectionState.wirelessEndpointAvailable = !host.empty() && port > 0;
+    gTransportSelectionState.wirelessHost = host;
+    gTransportSelectionState.wirelessPort = port;
+    gTransportSelectionState.serviceName = serviceName;
+}
+
+void ClearWirelessEndpointSelection(const std::string& serviceName) {
+    std::scoped_lock lock(gTransportSelectionMutex);
+    gTransportSelectionState.wirelessEndpointAvailable = false;
+    gTransportSelectionState.wirelessHost.clear();
+    gTransportSelectionState.wirelessPort = 0;
+    gTransportSelectionState.serviceName = serviceName;
+}
+
+bool WriteAllToSocket(int socketFd, const std::vector<uint8_t>& packet) {
+    size_t offset = 0;
+    while (offset < packet.size()) {
+        const ssize_t bytesSent = send(
+            socketFd,
+            packet.data() + offset,
+            packet.size() - offset,
+            MSG_NOSIGNAL);
+        if (bytesSent <= 0) {
+            return false;
+        }
+        offset += static_cast<size_t>(bytesSent);
+    }
+    return true;
 }
 
 void LogXrResult(XrInstance instance, const char* context, XrResult result) {
@@ -128,6 +212,52 @@ const std::array<XrHandJointEXT, 7>& HandOverlayJointSet() {
         XR_HAND_JOINT_LITTLE_TIP_EXT,
     };
     return joints;
+}
+
+const std::array<std::pair<XrHandJointEXT, const char*>, 5>& FingertipJointSet() {
+    static const std::array<std::pair<XrHandJointEXT, const char*>, 5> joints{{
+        {XR_HAND_JOINT_THUMB_TIP_EXT, "thumb_tip"},
+        {XR_HAND_JOINT_INDEX_TIP_EXT, "index_tip"},
+        {XR_HAND_JOINT_MIDDLE_TIP_EXT, "middle_tip"},
+        {XR_HAND_JOINT_RING_TIP_EXT, "ring_tip"},
+        {XR_HAND_JOINT_LITTLE_TIP_EXT, "little_tip"},
+    }};
+    return joints;
+}
+
+std::string JsonEscape(const std::string& value) {
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (const char character : value) {
+        switch (character) {
+            case '\\':
+                escaped += "\\\\";
+                break;
+            case '"':
+                escaped += "\\\"";
+                break;
+            default:
+                escaped += character;
+                break;
+        }
+    }
+    return escaped;
+}
+
+void AppendVector3Json(std::ostringstream& stream, const XrVector3f& value) {
+    stream << '[' << value.x << ',' << value.y << ',' << value.z << ']';
+}
+
+void AppendQuaternionJson(std::ostringstream& stream, const XrQuaternionf& value) {
+    stream << '[' << value.x << ',' << value.y << ',' << value.z << ',' << value.w << ']';
+}
+
+void AppendPoseJson(std::ostringstream& stream, const XrPosef& pose) {
+    stream << '{' << "\"position\":";
+    AppendVector3Json(stream, pose.position);
+    stream << ",\"orientation\":";
+    AppendQuaternionJson(stream, pose.orientation);
+    stream << '}';
 }
 
 const std::array<uint8_t, 7>& GlyphFor(char character) {
@@ -1022,6 +1152,9 @@ bool QuestPassthroughApp::RenderFrame() {
 
             const auto locateHand = [&](HandOverlayState* handState) {
                 handState->tracked = false;
+                for (auto& jointState : handState->joints) {
+                    jointState.tracked = false;
+                }
                 if (handState->tracker == XR_NULL_HANDLE) {
                     return;
                 }
@@ -1045,18 +1178,44 @@ bool QuestPassthroughApp::RenderFrame() {
                 }
 
                 handState->tracked = true;
+                size_t trackedJointCount = 0;
+                size_t trackedFingertipCount = 0;
                 for (size_t jointIndex = 0; jointIndex < jointLocations.size(); ++jointIndex) {
                     auto& jointState = handState->joints[jointIndex];
                     const XrHandJointLocationEXT& jointLocation = jointLocations[jointIndex];
-                    const XrSpaceLocationFlags requiredFlags =
-                        XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
-                    jointState.tracked = (jointLocation.locationFlags & requiredFlags) == requiredFlags;
+                    const bool positionValid =
+                        (jointLocation.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0;
+                    const bool orientationValid =
+                        (jointLocation.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0;
+                    jointState.tracked = positionValid;
                     if (!jointState.tracked) {
                         continue;
                     }
 
+                    trackedJointCount += 1;
                     jointState.pose = jointLocation.pose;
+                    if (!orientationValid) {
+                        jointState.pose.orientation = XrQuaternionf{0.0f, 0.0f, 0.0f, 1.0f};
+                    }
                     jointState.radius = std::max(0.0125f, jointLocation.radius * 1.4f);
+
+                    for (const auto& [joint, _name] : FingertipJointSet()) {
+                        if (static_cast<size_t>(joint) == jointIndex) {
+                            trackedFingertipCount += 1;
+                            break;
+                        }
+                    }
+                }
+
+                if ((telemetrySequence_ % kHandDiagnosticsLogEveryFrames) == 0) {
+                    const char* handLabel = handState == &leftHandOverlay_ ? "left" : "right";
+                    LogHandJointDiagnostics(
+                        handLabel,
+                        telemetrySequence_,
+                        jointLocations[XR_HAND_JOINT_WRIST_EXT],
+                        jointLocations[XR_HAND_JOINT_PALM_EXT],
+                        trackedJointCount,
+                        trackedFingertipCount);
                 }
             };
 
@@ -1139,7 +1298,7 @@ bool QuestPassthroughApp::RenderFrame() {
 }
 
 void QuestPassthroughApp::UpdateTelemetry(XrTime predictedDisplayTime) {
-    UpdateDiscoveryTelemetry();
+    const TransportSelection selection = ReadTransportSelection();
 
     if (telemetry_.localIp == "LOOKUP") {
         telemetry_.localIp = DetectLocalIp();
@@ -1147,35 +1306,322 @@ void QuestPassthroughApp::UpdateTelemetry(XrTime predictedDisplayTime) {
 
     telemetry_.trackingValid = false;
 
-    std::array<XrView, 2> views{{XrView{XR_TYPE_VIEW}, XrView{XR_TYPE_VIEW}}};
-    XrViewState viewState{XR_TYPE_VIEW_STATE};
-    XrViewLocateInfo locateInfo{XR_TYPE_VIEW_LOCATE_INFO};
-    locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-    locateInfo.displayTime = predictedDisplayTime;
-    locateInfo.space = appSpace_;
+    HmdPoseState headPose;
+    XrSpaceLocation viewLocation{XR_TYPE_SPACE_LOCATION};
+    const XrResult locateResult = xrLocateSpace(viewSpace_, appSpace_, predictedDisplayTime, &viewLocation);
+    if (XR_SUCCEEDED(locateResult)) {
+        const XrSpaceLocationFlags requiredFlags =
+            XR_SPACE_LOCATION_POSITION_VALID_BIT |
+            XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
+            XR_SPACE_LOCATION_POSITION_TRACKED_BIT |
+            XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+        headPose.valid = (viewLocation.locationFlags & requiredFlags) == requiredFlags;
+        headPose.position = viewLocation.pose.position;
+        headPose.orientation = viewLocation.pose.orientation;
+        telemetry_.trackingValid = headPose.valid;
+    }
 
-    uint32_t viewCountOutput = 0;
-    const XrResult xrResult = xrLocateViews(
-        session_,
-        &locateInfo,
-        &viewState,
-        static_cast<uint32_t>(views.size()),
-        &viewCountOutput,
-        views.data());
-    if (XR_SUCCEEDED(xrResult) && viewCountOutput == views.size()) {
-        const XrViewStateFlags requiredFlags =
-            XR_VIEW_STATE_ORIENTATION_VALID_BIT |
-            XR_VIEW_STATE_POSITION_VALID_BIT |
-            XR_VIEW_STATE_ORIENTATION_TRACKED_BIT |
-            XR_VIEW_STATE_POSITION_TRACKED_BIT;
-        telemetry_.trackingValid = (viewState.viewStateFlags & requiredFlags) == requiredFlags;
+    SyncTransportConnection(selection);
+    UpdateTransportTelemetry(selection);
+
+    if (transportSocketConnected_) {
+        const std::vector<uint8_t> packet = SerializeTelemetryPacket(selection, predictedDisplayTime, headPose);
+        if (SendTelemetryPacket(packet)) {
+            NoteSuccessfulPacketSend();
+        }
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (lastSuccessfulSendTime_.time_since_epoch().count() == 0 || now - lastSuccessfulSendTime_ > std::chrono::seconds(1)) {
+        telemetry_.packetRate = 0.0f;
     }
 }
 
-void QuestPassthroughApp::UpdateDiscoveryTelemetry() {
-    std::scoped_lock lock(gDiscoveryTelemetryMutex);
-    telemetry_.connectionState = gDiscoveryTelemetryState.connectionState;
-    telemetry_.targetHost = gDiscoveryTelemetryState.targetHost;
+void QuestPassthroughApp::UpdateTransportTelemetry(const TransportSelection& selection) {
+    telemetry_.targetHost = selection.hasEndpoint ? EndpointToString(selection.host, selection.port) : "SEARCHING";
+
+    if (selection.wiredMode) {
+        telemetry_.connectionState = transportSocketConnected_ ? "WIRED CONNECTED" : "WIRED WAITING";
+        return;
+    }
+
+    if (!selection.hasEndpoint) {
+        telemetry_.connectionState = "WIRELESS SEARCH";
+        return;
+    }
+
+    telemetry_.connectionState = transportSocketConnected_ ? "WIRELESS CONNECTED" : "WIRELESS WAIT";
+}
+
+QuestPassthroughApp::TransportSelection QuestPassthroughApp::ReadTransportSelection() const {
+    std::scoped_lock lock(gTransportSelectionMutex);
+
+    TransportSelection selection;
+    selection.wiredMode = gTransportSelectionState.wiredMode;
+    if (selection.wiredMode) {
+        selection.hasEndpoint = true;
+        selection.host = kWiredLoopbackHost;
+        selection.port = gTransportSelectionState.wiredPort;
+        return selection;
+    }
+
+    selection.hasEndpoint = gTransportSelectionState.wirelessEndpointAvailable;
+    selection.host = gTransportSelectionState.wirelessHost;
+    selection.port = gTransportSelectionState.wirelessPort;
+    return selection;
+}
+
+void QuestPassthroughApp::SyncTransportConnection(const TransportSelection& selection) {
+    const bool selectionChanged =
+        !transportSocketConnected_ ||
+        transportSocketWiredMode_ != selection.wiredMode ||
+        transportHost_ != selection.host ||
+        transportPort_ != selection.port;
+
+    if (!selection.hasEndpoint) {
+        if (transportSocketConnected_) {
+            LogInfo("Transport endpoint unavailable; closing active transport socket.");
+        }
+        CloseTransportConnection();
+        return;
+    }
+
+    if (!selectionChanged) {
+        return;
+    }
+
+    CloseTransportConnection();
+
+    const auto now = std::chrono::steady_clock::now();
+    if (nextReconnectAttempt_.time_since_epoch().count() != 0 && now < nextReconnectAttempt_) {
+        return;
+    }
+
+    if (!OpenTransportConnection(selection)) {
+        nextReconnectAttempt_ = now + kReconnectDelay;
+        return;
+    }
+
+    nextReconnectAttempt_ = std::chrono::steady_clock::time_point{};
+}
+
+bool QuestPassthroughApp::OpenTransportConnection(const TransportSelection& selection) {
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(selection.port);
+    if (inet_pton(AF_INET, selection.host.c_str(), &address.sin_addr) != 1) {
+        std::ostringstream stream;
+        stream << "Transport connection failed: invalid address " << selection.host;
+        LogError(stream.str());
+        return false;
+    }
+
+    const int socketType = selection.wiredMode ? SOCK_STREAM : SOCK_DGRAM;
+    const int socketFd = socket(AF_INET, socketType, 0);
+    if (socketFd < 0) {
+        LogError("Transport connection failed: unable to create socket.");
+        return false;
+    }
+
+    if (selection.wiredMode) {
+        const int flags = fcntl(socketFd, F_GETFL, 0);
+        if (flags < 0 || fcntl(socketFd, F_SETFL, flags | O_NONBLOCK) != 0) {
+            close(socketFd);
+            LogError("Transport connection failed: unable to configure non-blocking TCP socket.");
+            return false;
+        }
+
+        const int connectResult = connect(socketFd, reinterpret_cast<const sockaddr*>(&address), sizeof(address));
+        if (connectResult != 0 && errno != EINPROGRESS) {
+            close(socketFd);
+            std::ostringstream stream;
+            stream << "Wired TCP connection failed to " << EndpointToString(selection.host, selection.port)
+                   << " (errno=" << errno << ")";
+            LogError(stream.str());
+            return false;
+        }
+
+        if (connectResult != 0) {
+            pollfd pollDescriptor{};
+            pollDescriptor.fd = socketFd;
+            pollDescriptor.events = POLLOUT;
+            const int pollResult = poll(&pollDescriptor, 1, kConnectTimeoutMs);
+            if (pollResult <= 0) {
+                close(socketFd);
+                std::ostringstream stream;
+                stream << "Wired TCP connection timed out for " << EndpointToString(selection.host, selection.port);
+                LogError(stream.str());
+                return false;
+            }
+
+            int socketError = 0;
+            socklen_t socketErrorSize = sizeof(socketError);
+            if (getsockopt(socketFd, SOL_SOCKET, SO_ERROR, &socketError, &socketErrorSize) != 0 || socketError != 0) {
+                close(socketFd);
+                std::ostringstream stream;
+                stream << "Wired TCP connection failed for " << EndpointToString(selection.host, selection.port)
+                       << " (errno=" << socketError << ")";
+                LogError(stream.str());
+                return false;
+            }
+        }
+
+        if (fcntl(socketFd, F_SETFL, flags) != 0) {
+            close(socketFd);
+            LogError("Transport connection failed: unable to restore TCP socket flags.");
+            return false;
+        }
+    } else if (connect(socketFd, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0) {
+        close(socketFd);
+        std::ostringstream stream;
+        stream << "Wireless UDP connection setup failed for " << EndpointToString(selection.host, selection.port)
+               << " (errno=" << errno << ")";
+        LogError(stream.str());
+        return false;
+    }
+
+    transportSocket_ = socketFd;
+    transportSocketConnected_ = true;
+    transportSocketWiredMode_ = selection.wiredMode;
+    transportHost_ = selection.host;
+    transportPort_ = selection.port;
+
+    std::ostringstream stream;
+    stream << (selection.wiredMode ? "Using wired ADB reverse TCP path: " : "Using wireless Avahi UDP path: ")
+           << EndpointToString(selection.host, selection.port);
+    LogInfo(stream.str());
+    return true;
+}
+
+void QuestPassthroughApp::CloseTransportConnection() {
+    if (transportSocket_ >= 0) {
+        close(transportSocket_);
+    }
+    transportSocket_ = -1;
+    transportSocketConnected_ = false;
+    transportSocketWiredMode_ = false;
+    transportHost_.clear();
+    transportPort_ = 0;
+}
+
+bool QuestPassthroughApp::SendTelemetryPacket(const std::vector<uint8_t>& packet) {
+    if (!transportSocketConnected_ || transportSocket_ < 0) {
+        return false;
+    }
+
+    const bool success = transportSocketWiredMode_
+        ? WriteAllToSocket(transportSocket_, packet)
+        : send(transportSocket_, packet.data(), packet.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(packet.size());
+    if (success) {
+        return true;
+    }
+
+    std::ostringstream stream;
+    stream << (transportSocketWiredMode_ ? "Wired TCP send failed for " : "Wireless UDP send failed for ")
+           << EndpointToString(transportHost_, transportPort_)
+           << " (errno=" << errno << ')';
+    LogError(stream.str());
+    CloseTransportConnection();
+    nextReconnectAttempt_ = std::chrono::steady_clock::now() + kReconnectDelay;
+    return false;
+}
+
+std::vector<uint8_t> QuestPassthroughApp::SerializeTelemetryPacket(
+    const TransportSelection& selection,
+    XrTime predictedDisplayTime,
+    const HmdPoseState& headPose) {
+    std::ostringstream payloadStream;
+    payloadStream << std::fixed << std::setprecision(6);
+    const auto appendHandJson = [&](const HandOverlayState& handState) {
+        const auto& wrist = handState.joints[XR_HAND_JOINT_WRIST_EXT];
+        const auto& palm = handState.joints[XR_HAND_JOINT_PALM_EXT];
+
+        payloadStream << '{'
+                      << "\"tracked\":" << (handState.tracked ? "true" : "false") << ','
+                      << "\"wrist\":{";
+        payloadStream << "\"tracked\":" << (wrist.tracked ? "true" : "false");
+        if (wrist.tracked) {
+            payloadStream << ",\"pose\":";
+            AppendPoseJson(payloadStream, wrist.pose);
+        }
+
+        payloadStream << "},\"palm\":{";
+        payloadStream << "\"tracked\":" << (palm.tracked ? "true" : "false");
+        if (palm.tracked) {
+            payloadStream << ",\"pose\":";
+            AppendPoseJson(payloadStream, palm.pose);
+        }
+
+        payloadStream << "},\"fingertips\":{";
+        bool firstFingertip = true;
+        for (const auto& [joint, name] : FingertipJointSet()) {
+            if (!firstFingertip) {
+                payloadStream << ',';
+            }
+            firstFingertip = false;
+
+            const auto& jointState = handState.joints[joint];
+            payloadStream << '"' << name << "\":{";
+            payloadStream << "\"tracked\":" << (jointState.tracked ? "true" : "false");
+            if (jointState.tracked) {
+                payloadStream << ",\"pose\":";
+                AppendPoseJson(payloadStream, jointState.pose);
+                payloadStream << ",\"radius\":" << jointState.radius;
+            }
+            payloadStream << '}';
+        }
+        payloadStream << "}}";
+    };
+
+    payloadStream << '{'
+                  << "\"type\":\"quest_telemetry\","
+                  << "\"version\":1,"
+                  << "\"sequence\":" << telemetrySequence_++ << ','
+                  << "\"transport\":\"" << (selection.wiredMode ? "wired" : "wireless") << "\","
+                  << "\"display_time_ns\":" << static_cast<long long>(predictedDisplayTime) << ','
+                  << "\"tracking_valid\":" << (telemetry_.trackingValid ? "true" : "false") << ','
+                  << "\"head_pose\":{"
+                  << "\"valid\":" << (headPose.valid ? "true" : "false") << ','
+                  << "\"position\":";
+    AppendVector3Json(payloadStream, headPose.position);
+    payloadStream << ",\"orientation\":";
+    AppendQuaternionJson(payloadStream, headPose.orientation);
+    payloadStream << "},\"hands\":{";
+    payloadStream << "\"left\":";
+    appendHandJson(leftHandOverlay_);
+    payloadStream << ",\"right\":";
+    appendHandJson(rightHandOverlay_);
+    payloadStream << "},\"status\":{";
+    payloadStream << "\"connection_state\":\"" << JsonEscape(telemetry_.connectionState) << "\",";
+    payloadStream << "\"target_host\":\"" << JsonEscape(telemetry_.targetHost) << "\"}}";
+
+    const std::string payload = payloadStream.str();
+    const uint32_t payloadSize = static_cast<uint32_t>(payload.size());
+    std::vector<uint8_t> packet(4 + payloadSize);
+    packet[0] = static_cast<uint8_t>((payloadSize >> 24) & 0xff);
+    packet[1] = static_cast<uint8_t>((payloadSize >> 16) & 0xff);
+    packet[2] = static_cast<uint8_t>((payloadSize >> 8) & 0xff);
+    packet[3] = static_cast<uint8_t>(payloadSize & 0xff);
+    std::memcpy(packet.data() + 4, payload.data(), payloadSize);
+    return packet;
+}
+
+void QuestPassthroughApp::NoteSuccessfulPacketSend() {
+    const auto now = std::chrono::steady_clock::now();
+    if (packetWindowStart_.time_since_epoch().count() == 0) {
+        packetWindowStart_ = now;
+        packetWindowCount_ = 0;
+    }
+
+    ++packetWindowCount_;
+    lastSuccessfulSendTime_ = now;
+
+    const std::chrono::duration<float> elapsed = now - packetWindowStart_;
+    if (elapsed.count() >= 1.0f) {
+        telemetry_.packetRate = static_cast<float>(packetWindowCount_) / elapsed.count();
+        packetWindowStart_ = now;
+        packetWindowCount_ = 0;
+    }
 }
 
 void QuestPassthroughApp::RenderHudToSwapchain(uint32_t imageIndex) {
@@ -1201,6 +1647,7 @@ void QuestPassthroughApp::RenderHudToSwapchain(uint32_t imageIndex) {
     packetRateStream << std::fixed << std::setprecision(1) << telemetry_.packetRate << " PPS";
 
     const std::string trackingText = telemetry_.trackingValid ? "VALID" : "INVALID";
+    const bool connected = telemetry_.connectionState.find("CONNECTED") != std::string::npos;
 
     DrawText(pixels, hudWidth_, hudHeight_, leftLabelX, 90, contentScale, "CONNECTION:", 130, 180, 255, 255);
     DrawText(
@@ -1211,9 +1658,9 @@ void QuestPassthroughApp::RenderHudToSwapchain(uint32_t imageIndex) {
         90,
         contentScale,
         telemetry_.connectionState,
-        telemetry_.connectionState == "CONNECTED" ? 64 : 255,
-        telemetry_.connectionState == "CONNECTED" ? 255 : 88,
-        telemetry_.connectionState == "CONNECTED" ? 128 : 88,
+        connected ? 64 : 255,
+        connected ? 255 : 88,
+        connected ? 128 : 88,
         255);
 
     DrawText(pixels, hudWidth_, hudHeight_, leftLabelX, 126, contentScale, "PACKET RATE:", 130, 180, 255, 255);
@@ -1369,6 +1816,7 @@ void QuestPassthroughApp::Shutdown() {
         return;
     }
 
+    CloseTransportConnection();
     ShutdownOpenXr();
     ShutdownEgl();
     initialized_ = false;
@@ -1441,6 +1889,26 @@ void QuestPassthroughApp::ShutdownOpenXr() {
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_com_example_metareader_MetaReaderActivity_nativeOnTransportModeChanged(
+    JNIEnv* env,
+    jclass /* clazz */,
+    jstring mode,
+    jstring detail,
+    jint wiredPort) {
+    const std::string modeText = JStringToUtf8(env, mode);
+    const std::string detailText = JStringToUtf8(env, detail);
+    const bool wiredMode = modeText == "WIRED";
+    SetTransportModeSelection(wiredMode, static_cast<uint16_t>(wiredPort), detailText);
+
+    std::ostringstream stream;
+    stream << "Transport mode changed: " << (wiredMode ? "wired ADB reverse TCP" : "wireless Avahi DNS-SD");
+    if (!detailText.empty()) {
+        stream << " (" << detailText << ')';
+    }
+    LogInfo(stream.str());
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_com_example_metareader_MetaReaderActivity_nativeOnDiscoveryState(
     JNIEnv* env,
     jclass /* clazz */,
@@ -1448,7 +1916,6 @@ Java_com_example_metareader_MetaReaderActivity_nativeOnDiscoveryState(
     jstring detail) {
     const std::string stateText = JStringToUtf8(env, state);
     const std::string detailText = JStringToUtf8(env, detail);
-    SetDiscoveryTelemetryState(stateText.empty() ? "DISCOVERING" : stateText, "SEARCHING", {});
 
     std::ostringstream stream;
     stream << "Service discovery state: " << (stateText.empty() ? "DISCOVERING" : stateText);
@@ -1476,7 +1943,7 @@ Java_com_example_metareader_MetaReaderActivity_nativeOnServiceResolved(
         endpointStream << ':' << port;
     }
 
-    SetDiscoveryTelemetryState("DISCOVERED", endpointStream.str(), serviceNameText);
+    SetWirelessEndpointSelection(hostText, static_cast<uint16_t>(port), serviceNameText);
 
     std::ostringstream stream;
     stream << "Resolved service " << serviceNameText << " -> " << endpointStream.str();
@@ -1492,7 +1959,7 @@ Java_com_example_metareader_MetaReaderActivity_nativeOnServiceLost(
     jclass /* clazz */,
     jstring serviceName) {
     const std::string serviceNameText = JStringToUtf8(env, serviceName);
-    SetDiscoveryTelemetryState("SEARCHING", "SEARCHING", serviceNameText);
+    ClearWirelessEndpointSelection(serviceNameText);
 
     std::ostringstream stream;
     stream << "Lost service " << serviceNameText;

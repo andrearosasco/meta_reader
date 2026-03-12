@@ -16,6 +16,8 @@ Build a native Quest Android app in C++ using OpenXR with `XR_FB_passthrough` en
 - Passthrough frame submission is validated on-device after removing the invalid passthrough-layer `space` and preferring `XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND`.
 - Quest-side DNS-SD discovery is wired through a custom `NativeActivity` subclass using Android `NsdManager`.
 - Linux-side receiver discovery is supported by `receiver.sh` / `scripts/quest_teleop_receiver.py` using Avahi when available.
+- Quest-side transport selection now uses USB/ADB state: wired ADB-reverse TCP when cable-connected, otherwise wireless Avahi DNS-SD + UDP.
+- Linux-side receiver now accepts the same framed telemetry packets over both wireless UDP and wired TCP.
 
 ## Active Todos
 1. Visually confirm Quest-side DNS-SD discovery against the Linux receiver announcer

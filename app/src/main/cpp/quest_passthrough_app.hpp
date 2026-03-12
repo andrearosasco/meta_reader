@@ -5,8 +5,9 @@
 #include <android_native_app_glue.h>
 #include <openxr/openxr_platform.h>
 
-#include <cstdint>
 #include <array>
+#include <chrono>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -27,6 +28,19 @@ private:
         std::string targetHost{"SEARCHING"};
     };
 
+    struct HmdPoseState {
+        bool valid{false};
+        XrVector3f position{0.0f, 0.0f, 0.0f};
+        XrQuaternionf orientation{0.0f, 0.0f, 0.0f, 1.0f};
+    };
+
+    struct TransportSelection {
+        bool wiredMode{false};
+        bool hasEndpoint{false};
+        std::string host;
+        uint16_t port{0};
+    };
+
     bool Initialize();
     bool InitializeEgl();
     bool InitializeOpenXr();
@@ -44,7 +58,17 @@ private:
     void HandleSessionStateChanged(const XrEventDataSessionStateChanged& stateChangedEvent, bool* shouldExit);
     bool RenderFrame();
     void UpdateTelemetry(XrTime predictedDisplayTime);
-    void UpdateDiscoveryTelemetry();
+    void UpdateTransportTelemetry(const TransportSelection& selection);
+    TransportSelection ReadTransportSelection() const;
+    void SyncTransportConnection(const TransportSelection& selection);
+    bool OpenTransportConnection(const TransportSelection& selection);
+    void CloseTransportConnection();
+    bool SendTelemetryPacket(const std::vector<uint8_t>& packet);
+    std::vector<uint8_t> SerializeTelemetryPacket(
+        const TransportSelection& selection,
+        XrTime predictedDisplayTime,
+        const HmdPoseState& headPose);
+    void NoteSuccessfulPacketSend();
     void RenderHudToSwapchain(uint32_t imageIndex);
     void RenderHandOverlayToSwapchain(uint32_t imageIndex);
     std::string MakeHudSnapshot() const;
@@ -123,4 +147,14 @@ private:
 
     std::vector<std::string> availableInstanceExtensions_;
     TelemetryState telemetry_;
+    int transportSocket_{-1};
+    bool transportSocketConnected_{false};
+    bool transportSocketWiredMode_{false};
+    std::string transportHost_;
+    uint16_t transportPort_{0};
+    uint64_t telemetrySequence_{0};
+    uint32_t packetWindowCount_{0};
+    std::chrono::steady_clock::time_point packetWindowStart_{};
+    std::chrono::steady_clock::time_point lastSuccessfulSendTime_{};
+    std::chrono::steady_clock::time_point nextReconnectAttempt_{};
 };
