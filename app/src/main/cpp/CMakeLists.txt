@@ -26,6 +26,7 @@ add_library(
     hud_renderer.cpp
     main.cpp
     quest_passthrough_app.cpp
+    quest_passthrough_lifecycle.cpp
     transport_telemetry.cpp
 )
 

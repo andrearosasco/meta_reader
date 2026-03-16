@@ -9,3 +9,5 @@ app/build/
 *.apk
 *.aab
 .conda/
+__pycache__/
+*.py[cod]
