@@ -198,6 +198,7 @@ def _make_udp_socket(bind_host: str, port: int) -> socket.socket:
 def _make_tcp_socket(bind_host: str, port: int) -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    print(f"Setting up TCP socket on {bind_host}:{port} for adb reverse")
     sock.bind((bind_host, port))
     sock.listen()
     sock.setblocking(False)

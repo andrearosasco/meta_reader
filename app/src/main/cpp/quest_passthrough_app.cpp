@@ -109,8 +109,8 @@ bool QuestPassthroughApp::RenderFrame() {
             static_cast<int32_t>(hudHeight_)};
         hudLayer.subImage.imageArrayIndex = 0;
         hudLayer.pose = IdentityPose();
-        hudLayer.pose.position = {0.0f, -0.12f, -1.0f};
-        hudLayer.size = {1.5f, 0.32f};
+        hudLayer.pose.position = {0.46f, 0.24f, -1.0f};
+        hudLayer.size = {0.52f, 0.17f};
 
         layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&passthroughLayer));
         layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&hudLayer));

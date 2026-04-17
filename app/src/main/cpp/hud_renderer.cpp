@@ -136,17 +136,17 @@ void RenderHudTexture(GLuint texture, uint32_t width, uint32_t height, const std
 
     DrawRect(pixels, width, height, 16, 16, static_cast<int>(width) - 32, static_cast<int>(height) - 32, 8, 10, 18, 196);
     DrawRect(pixels, width, height, 16, 16, static_cast<int>(width) - 32, 4, 0, 176, 255, 220);
-    DrawText(pixels, width, height, 40, 34, 4, "META READER", 255, 255, 255, 255);
-    DrawText(pixels, width, height, 40, 90, 3, "CONNECTION:", 130, 180, 255, 255);
-    DrawText(pixels, width, height, 280, 90, 3, connectionState, connected ? 64 : 255, connected ? 255 : 88, connected ? 128 : 88, 255);
-    DrawText(pixels, width, height, 40, 126, 3, "PACKET RATE:", 130, 180, 255, 255);
-    DrawText(pixels, width, height, 280, 126, 3, packetRateText.str(), 255, 255, 255, 255);
-    DrawText(pixels, width, height, 40, 162, 3, "TRACKING:", 130, 180, 255, 255);
-    DrawText(pixels, width, height, 280, 162, 3, trackingValid ? "VALID" : "INVALID", trackingValid ? 64 : 255, trackingValid ? 255 : 88, trackingValid ? 128 : 88, 255);
-    DrawText(pixels, width, height, 760, 90, 3, "LOCAL IP:", 130, 180, 255, 255);
-    DrawText(pixels, width, height, 1020, 90, 3, localIp, 255, 255, 255, 255);
-    DrawText(pixels, width, height, 760, 126, 3, "TARGET HOST:", 130, 180, 255, 255);
-    DrawText(pixels, width, height, 1020, 126, 3, targetHost, 255, 255, 255, 255);
+    DrawText(pixels, width, height, 40, 34, 2, "META READER", 255, 255, 255, 255);
+    DrawText(pixels, width, height, 40, 90, 2, "CONNECTION:", 130, 180, 255, 255);
+    DrawText(pixels, width, height, 280, 90, 2, connectionState, connected ? 64 : 255, connected ? 255 : 88, connected ? 128 : 88, 255);
+    DrawText(pixels, width, height, 40, 126, 2, "PACKET RATE:", 130, 180, 255, 255);
+    DrawText(pixels, width, height, 280, 126, 2, packetRateText.str(), 255, 255, 255, 255);
+    DrawText(pixels, width, height, 40, 162, 2, "TRACKING:", 130, 180, 255, 255);
+    DrawText(pixels, width, height, 280, 162, 2, trackingValid ? "VALID" : "INVALID", trackingValid ? 64 : 255, trackingValid ? 255 : 88, trackingValid ? 128 : 88, 255);
+    DrawText(pixels, width, height, 760, 90, 2, "LOCAL IP:", 130, 180, 255, 255);
+    DrawText(pixels, width, height, 1020, 90, 2, localIp, 255, 255, 255, 255);
+    DrawText(pixels, width, height, 760, 126, 2, "TARGET HOST:", 130, 180, 255, 255);
+    DrawText(pixels, width, height, 1020, 126, 2, targetHost, 255, 255, 255, 255);
     UploadTexture(texture, width, height, pixels, true);
 }
 
