@@ -7,7 +7,6 @@
 
 std::string BuildHudSnapshot(
     const std::string& connectionState,
-    float packetRate,
     bool trackingValid,
     const std::string& localIp,
     const std::string& targetHost);
@@ -17,7 +16,6 @@ void RenderHudTexture(
     uint32_t width,
     uint32_t height,
     const std::string& connectionState,
-    float packetRate,
     bool trackingValid,
     const std::string& localIp,
     const std::string& targetHost);

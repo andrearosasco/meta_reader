@@ -135,10 +135,9 @@ bool QuestPassthroughApp::RenderFrame() {
 }
 
 bool QuestPassthroughApp::RefreshHudTexture() {
-    const TelemetryState& telemetry = transport_.telemetry();
+    const TelemetryState telemetry = transport_.SnapshotTelemetry();
     const std::string hudSnapshot = BuildHudSnapshot(
         telemetry.connectionState,
-        telemetry.packetRate,
         telemetry.trackingValid,
         telemetry.localIp,
         telemetry.targetHost);
@@ -155,7 +154,6 @@ bool QuestPassthroughApp::RefreshHudTexture() {
         hudWidth_,
         hudHeight_,
         telemetry.connectionState,
-        telemetry.packetRate,
         telemetry.trackingValid,
         telemetry.localIp,
         telemetry.targetHost);
@@ -283,21 +281,11 @@ void QuestPassthroughApp::AppendHandLayers(
 }
 
 void QuestPassthroughApp::UpdateTelemetry(XrTime predictedDisplayTime, const HmdPoseState& headPose) {
-    const TransportSelection selection = transport_.ReadSelection();
-    transport_.telemetry().trackingValid = headPose.valid;
-    transport_.SyncConnection(selection);
-    transport_.UpdateStatus(selection);
-
-    const std::vector<uint8_t> packet = transport_.SerializePacket(
-        selection,
+    transport_.PublishFrame(
         predictedDisplayTime,
         headPose,
         BuildHandTelemetry(leftHandOverlay_),
         BuildHandTelemetry(rightHandOverlay_));
-    if (transport_.SendPacket(packet)) {
-        transport_.NoteSuccessfulPacketSend();
-    }
-    transport_.ResetPacketRateIfStale();
 }
 
 extern "C" JNIEXPORT void JNICALL

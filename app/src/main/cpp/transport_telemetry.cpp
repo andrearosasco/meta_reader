@@ -6,15 +6,17 @@
 #include <fcntl.h>
 #include <ifaddrs.h>
 #include <net/if.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <array>
+#include <cerrno>
 #include <cstring>
 #include <iomanip>
-#include <mutex>
 #include <sstream>
+#include <utility>
 
 namespace {
 
@@ -70,13 +72,24 @@ bool WriteAllToSocket(int socketFd, const std::vector<uint8_t>& packet) {
             socketFd,
             packet.data() + offset,
             packet.size() - offset,
-            MSG_NOSIGNAL);
+            MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (bytesSent < 0 && errno == EINTR) {
+            continue;
+        }
         if (bytesSent <= 0) {
             return false;
         }
         offset += static_cast<size_t>(bytesSent);
     }
     return true;
+}
+
+bool ConfigureSocketNonBlocking(int socketFd) {
+    const int flags = fcntl(socketFd, F_GETFL, 0);
+    if (flags < 0) {
+        return false;
+    }
+    return fcntl(socketFd, F_SETFL, flags | O_NONBLOCK) == 0;
 }
 
 void AppendVector3Json(std::ostringstream& stream, const XrVector3f& value) {
@@ -122,10 +135,43 @@ std::vector<uint8_t> MakeLengthPrefixedPacket(const std::string& payload) {
 
 TransportTelemetryBridge::TransportTelemetryBridge() {
     telemetry_.localIp = DetectLocalIp();
+    workerThread_ = std::thread(&TransportTelemetryBridge::WorkerMain, this);
 }
 
 TransportTelemetryBridge::~TransportTelemetryBridge() {
+    {
+        std::scoped_lock lock(stateMutex_);
+        stopRequested_ = true;
+    }
+    stateCondition_.notify_all();
+    if (workerThread_.joinable()) {
+        workerThread_.join();
+    }
     CloseConnection();
+}
+
+TelemetryState TransportTelemetryBridge::SnapshotTelemetry() const {
+    std::scoped_lock lock(stateMutex_);
+    return telemetry_;
+}
+
+void TransportTelemetryBridge::PublishFrame(
+    XrTime predictedDisplayTime,
+    const HmdPoseState& headPose,
+    const HandTelemetryState& leftHand,
+    const HandTelemetryState& rightHand) {
+    {
+        std::scoped_lock lock(stateMutex_);
+        pendingFrame_ = TelemetryFrameSample{
+            .sequence = nextSequence_++,
+            .predictedDisplayTime = predictedDisplayTime,
+            .headPose = headPose,
+            .leftHand = leftHand,
+            .rightHand = rightHand,
+        };
+        telemetry_.trackingValid = headPose.valid;
+    }
+    stateCondition_.notify_one();
 }
 
 void TransportTelemetryBridge::SetTransportModeSelection(bool wiredMode, uint16_t wiredPort) {
@@ -172,6 +218,7 @@ TransportSelection TransportTelemetryBridge::ReadSelection() const {
 }
 
 void TransportTelemetryBridge::UpdateStatus(const TransportSelection& selection) {
+    std::scoped_lock lock(stateMutex_);
     telemetry_.targetHost = selection.hasEndpoint ? EndpointToString(selection.host, selection.port) : "SEARCHING";
     if (selection.wiredMode) {
         telemetry_.connectionState = transportSocket_ >= 0 ? "WIRED CONNECTED" : "WIRED WAITING";
@@ -234,10 +281,8 @@ bool TransportTelemetryBridge::SendPacket(const std::vector<uint8_t>& packet) {
 
 std::vector<uint8_t> TransportTelemetryBridge::SerializePacket(
     const TransportSelection& selection,
-    XrTime predictedDisplayTime,
-    const HmdPoseState& headPose,
-    const HandTelemetryState& leftHand,
-    const HandTelemetryState& rightHand) const {
+    const TelemetryFrameSample& frame,
+    const TelemetryState& telemetry) const {
     std::ostringstream payloadStream;
     payloadStream << std::fixed << std::setprecision(6);
 
@@ -262,49 +307,64 @@ std::vector<uint8_t> TransportTelemetryBridge::SerializePacket(
     payloadStream << '{'
                   << "\"type\":\"quest_telemetry\"," 
                   << "\"version\":1,"
-                  << "\"sequence\":" << telemetrySequence_++ << ','
+                  << "\"sequence\":" << frame.sequence << ','
                   << "\"transport\":\"" << (selection.wiredMode ? "wired" : "wireless") << "\"," 
-                  << "\"display_time_ns\":" << static_cast<long long>(predictedDisplayTime) << ','
-                  << "\"tracking_valid\":" << (telemetry_.trackingValid ? "true" : "false") << ','
+                  << "\"display_time_ns\":" << static_cast<long long>(frame.predictedDisplayTime) << ','
+                  << "\"tracking_valid\":" << (frame.headPose.valid ? "true" : "false") << ','
                   << "\"head_pose\":{"
-                  << "\"valid\":" << (headPose.valid ? "true" : "false") << ','
+                  << "\"valid\":" << (frame.headPose.valid ? "true" : "false") << ','
                   << "\"position\":";
-    AppendVector3Json(payloadStream, headPose.position);
+    AppendVector3Json(payloadStream, frame.headPose.position);
     payloadStream << ",\"orientation\":";
-    AppendQuaternionJson(payloadStream, headPose.orientation);
+    AppendQuaternionJson(payloadStream, frame.headPose.orientation);
     payloadStream << "},\"hands\":{";
     payloadStream << "\"left\":";
-    appendHandJson(leftHand);
+    appendHandJson(frame.leftHand);
     payloadStream << ",\"right\":";
-    appendHandJson(rightHand);
+    appendHandJson(frame.rightHand);
     payloadStream << "},\"status\":{"
-                  << "\"connection_state\":\"" << telemetry_.connectionState << "\"," 
-                  << "\"target_host\":\"" << telemetry_.targetHost << "\"}}";
+                  << "\"connection_state\":\"" << telemetry.connectionState << "\"," 
+                  << "\"target_host\":\"" << telemetry.targetHost << "\"}}";
     return MakeLengthPrefixedPacket(payloadStream.str());
 }
 
-void TransportTelemetryBridge::NoteSuccessfulPacketSend() {
-    const auto now = std::chrono::steady_clock::now();
-    if (packetWindowStart_.time_since_epoch().count() == 0) {
-        packetWindowStart_ = now;
-        packetWindowCount_ = 0;
-    }
+void TransportTelemetryBridge::WorkerMain() {
+    while (true) {
+        std::optional<TelemetryFrameSample> frame;
+        {
+            std::unique_lock lock(stateMutex_);
+            stateCondition_.wait(lock, [&] {
+                return stopRequested_ || pendingFrame_.has_value();
+            });
+            if (stopRequested_) {
+                break;
+            }
+            frame = std::move(pendingFrame_);
+            pendingFrame_.reset();
+        }
 
-    ++packetWindowCount_;
-    lastSuccessfulSendTime_ = now;
+        if (!frame.has_value()) {
+            continue;
+        }
 
-    const std::chrono::duration<float> elapsed = now - packetWindowStart_;
-    if (elapsed.count() >= 1.0f) {
-        telemetry_.packetRate = static_cast<float>(packetWindowCount_) / elapsed.count();
-        packetWindowStart_ = now;
-        packetWindowCount_ = 0;
-    }
-}
+        const TransportSelection selection = ReadSelection();
+        UpdateStatus(selection);
+        if (!selection.hasEndpoint) {
+            CloseConnection();
+            UpdateStatus(selection);
+            continue;
+        }
 
-void TransportTelemetryBridge::ResetPacketRateIfStale() {
-    const auto now = std::chrono::steady_clock::now();
-    if (lastSuccessfulSendTime_.time_since_epoch().count() == 0 || now - lastSuccessfulSendTime_ > std::chrono::seconds(1)) {
-        telemetry_.packetRate = 0.0f;
+        SyncConnection(selection);
+        UpdateStatus(selection);
+        if (transportSocket_ < 0) {
+            continue;
+        }
+
+        const TelemetryState telemetry = SnapshotTelemetry();
+        const std::vector<uint8_t> packet = SerializePacket(selection, *frame, telemetry);
+        SendPacket(packet);
+        UpdateStatus(selection);
     }
 }
 
@@ -329,12 +389,11 @@ bool TransportTelemetryBridge::OpenConnection(const TransportSelection& selectio
         return false;
     };
 
-    if (selection.wiredMode) {
-        const int flags = fcntl(socketFd, F_GETFL, 0);
-        if (flags < 0 || fcntl(socketFd, F_SETFL, flags | O_NONBLOCK) != 0) {
-            return fail("Transport connection failed: unable to configure non-blocking TCP socket.");
-        }
+    if (!ConfigureSocketNonBlocking(socketFd)) {
+        return fail("Transport connection failed: unable to configure non-blocking transport socket.");
+    }
 
+    if (selection.wiredMode) {
         const int connectResult = connect(socketFd, reinterpret_cast<const sockaddr*>(&address), sizeof(address));
         if (connectResult != 0 && errno != EINPROGRESS) {
             return fail("Wired TCP connection failed to " + EndpointToString(selection.host, selection.port) + " (errno=" + std::to_string(errno) + ")");
@@ -355,8 +414,9 @@ bool TransportTelemetryBridge::OpenConnection(const TransportSelection& selectio
             }
         }
 
-        if (fcntl(socketFd, F_SETFL, flags) != 0) {
-            return fail("Transport connection failed: unable to restore TCP socket flags.");
+        const int disableNagle = 1;
+        if (setsockopt(socketFd, IPPROTO_TCP, TCP_NODELAY, &disableNagle, sizeof(disableNagle)) != 0) {
+            LogError("Unable to disable TCP_NODELAY for wired transport.");
         }
     } else if (connect(socketFd, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0) {
         return fail("Wireless UDP connection setup failed for " + EndpointToString(selection.host, selection.port) + " (errno=" + std::to_string(errno) + ")");

@@ -80,8 +80,8 @@ private:
     XrPassthroughLayerFB passthroughLayer_{XR_NULL_HANDLE};
 
     XrSwapchain hudSwapchain_{XR_NULL_HANDLE};
-    uint32_t hudWidth_{1536};
-    uint32_t hudHeight_{288};
+    uint32_t hudWidth_{1024};
+    uint32_t hudHeight_{192};
     std::vector<XrSwapchainImageOpenGLESKHR> hudImages_;
     bool hudTextureInitialized_{false};
     std::string lastHudSnapshot_;

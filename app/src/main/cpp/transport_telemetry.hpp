@@ -6,13 +6,16 @@
 
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
+#include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 struct TelemetryState {
     std::string connectionState{"DISCOVERING"};
-    float packetRate{0.0f};
     bool trackingValid{false};
     std::string localIp{"LOOKUP"};
     std::string targetHost{"SEARCHING"};
@@ -53,8 +56,21 @@ public:
     static void SetWirelessEndpointSelection(const std::string& host, uint16_t port);
     static void ClearWirelessEndpointSelection();
 
-    TelemetryState& telemetry() { return telemetry_; }
-    const TelemetryState& telemetry() const { return telemetry_; }
+    TelemetryState SnapshotTelemetry() const;
+    void PublishFrame(
+        XrTime predictedDisplayTime,
+        const HmdPoseState& headPose,
+        const HandTelemetryState& leftHand,
+        const HandTelemetryState& rightHand);
+
+private:
+    struct TelemetryFrameSample {
+        uint64_t sequence{0};
+        XrTime predictedDisplayTime{0};
+        HmdPoseState headPose;
+        HandTelemetryState leftHand;
+        HandTelemetryState rightHand;
+    };
 
     TransportSelection ReadSelection() const;
     void UpdateStatus(const TransportSelection& selection);
@@ -62,26 +78,23 @@ public:
     bool SendPacket(const std::vector<uint8_t>& packet);
     std::vector<uint8_t> SerializePacket(
         const TransportSelection& selection,
-        XrTime predictedDisplayTime,
-        const HmdPoseState& headPose,
-        const HandTelemetryState& leftHand,
-        const HandTelemetryState& rightHand) const;
-    void NoteSuccessfulPacketSend();
-    void ResetPacketRateIfStale();
-
-private:
+        const TelemetryFrameSample& frame,
+        const TelemetryState& telemetry) const;
+    void WorkerMain();
     bool OpenConnection(const TransportSelection& selection);
     void CloseConnection();
     static std::string DetectLocalIp();
 
+    mutable std::mutex stateMutex_;
+    std::condition_variable stateCondition_;
     TelemetryState telemetry_;
+    std::optional<TelemetryFrameSample> pendingFrame_;
+    uint64_t nextSequence_{0};
+    bool stopRequested_{false};
+    std::thread workerThread_;
     int transportSocket_{-1};
     bool transportSocketWiredMode_{false};
     std::string transportHost_;
     uint16_t transportPort_{0};
-    mutable uint64_t telemetrySequence_{0};
-    uint32_t packetWindowCount_{0};
-    std::chrono::steady_clock::time_point packetWindowStart_{};
-    std::chrono::steady_clock::time_point lastSuccessfulSendTime_{};
     std::chrono::steady_clock::time_point nextReconnectAttempt_{};
 };

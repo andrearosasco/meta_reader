@@ -5,6 +5,8 @@ app/build/
 .android-sdk/
 .cxx/
 .idea/
+.codex
+.gradle-user/
 *.iml
 *.apk
 *.aab

@@ -117,36 +117,33 @@ void UploadTexture(GLuint texture, uint32_t width, uint32_t height, const std::v
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height), GL_RGBA, GL_UNSIGNED_BYTE, upload.data());
     glBindTexture(GL_TEXTURE_2D, 0);
-    glFlush();
 }
 
 }  // namespace
 
-std::string BuildHudSnapshot(const std::string& connectionState, float packetRate, bool trackingValid, const std::string& localIp, const std::string& targetHost) {
+std::string BuildHudSnapshot(const std::string& connectionState, bool trackingValid, const std::string& localIp, const std::string& targetHost) {
     std::ostringstream stream;
-    stream << connectionState << '|' << std::fixed << std::setprecision(1) << packetRate << '|' << (trackingValid ? '1' : '0') << '|' << localIp << '|' << targetHost;
+    stream << connectionState << '|' << (trackingValid ? '1' : '0') << '|' << localIp << '|' << targetHost;
     return stream.str();
 }
 
-void RenderHudTexture(GLuint texture, uint32_t width, uint32_t height, const std::string& connectionState, float packetRate, bool trackingValid, const std::string& localIp, const std::string& targetHost) {
+void RenderHudTexture(GLuint texture, uint32_t width, uint32_t height, const std::string& connectionState, bool trackingValid, const std::string& localIp, const std::string& targetHost) {
     std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * 4, 0);
     const bool connected = connectionState.find("CONNECTED") != std::string::npos;
-    std::ostringstream packetRateText;
-    packetRateText << std::fixed << std::setprecision(1) << packetRate << " PPS";
 
     DrawRect(pixels, width, height, 16, 16, static_cast<int>(width) - 32, static_cast<int>(height) - 32, 8, 10, 18, 196);
     DrawRect(pixels, width, height, 16, 16, static_cast<int>(width) - 32, 4, 0, 176, 255, 220);
     DrawText(pixels, width, height, 40, 34, 2, "META READER", 255, 255, 255, 255);
     DrawText(pixels, width, height, 40, 90, 2, "CONNECTION:", 130, 180, 255, 255);
     DrawText(pixels, width, height, 280, 90, 2, connectionState, connected ? 64 : 255, connected ? 255 : 88, connected ? 128 : 88, 255);
-    DrawText(pixels, width, height, 40, 126, 2, "PACKET RATE:", 130, 180, 255, 255);
-    DrawText(pixels, width, height, 280, 126, 2, packetRateText.str(), 255, 255, 255, 255);
+    DrawText(pixels, width, height, 40, 126, 2, "STREAM:", 130, 180, 255, 255);
+    DrawText(pixels, width, height, 280, 126, 2, connected ? "LIVE" : "IDLE", 255, 255, 255, 255);
     DrawText(pixels, width, height, 40, 162, 2, "TRACKING:", 130, 180, 255, 255);
     DrawText(pixels, width, height, 280, 162, 2, trackingValid ? "VALID" : "INVALID", trackingValid ? 64 : 255, trackingValid ? 255 : 88, trackingValid ? 128 : 88, 255);
-    DrawText(pixels, width, height, 760, 90, 2, "LOCAL IP:", 130, 180, 255, 255);
-    DrawText(pixels, width, height, 1020, 90, 2, localIp, 255, 255, 255, 255);
-    DrawText(pixels, width, height, 760, 126, 2, "TARGET HOST:", 130, 180, 255, 255);
-    DrawText(pixels, width, height, 1020, 126, 2, targetHost, 255, 255, 255, 255);
+    DrawText(pixels, width, height, 560, 90, 2, "LOCAL IP:", 130, 180, 255, 255);
+    DrawText(pixels, width, height, 760, 90, 2, localIp, 255, 255, 255, 255);
+    DrawText(pixels, width, height, 560, 126, 2, "TARGET HOST:", 130, 180, 255, 255);
+    DrawText(pixels, width, height, 760, 126, 2, targetHost, 255, 255, 255, 255);
     UploadTexture(texture, width, height, pixels, true);
 }
 
